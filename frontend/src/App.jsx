@@ -428,6 +428,14 @@ function App() {
               </>
             )}
           </button>
+
+          <button
+            type="button"
+            onClick={resetForm}
+            className="w-full mt-2 p-2.5 rounded-xl font-medium border border-gray-600 text-gray-300 hover:bg-gray-700/50 hover:border-gray-500 transition-all duration-200 flex items-center justify-center gap-2"
+          >
+            🔄 Refresh (clear form & result)
+          </button>
         </div>
 
         {result && (

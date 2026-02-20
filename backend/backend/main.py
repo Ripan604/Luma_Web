@@ -192,9 +192,39 @@ def generate_bot_data(count: int = 30):
 # DEMO: GET BOT VECTOR (for presentation)
 # ===============================
 
+def _predict_probability(vec_list: list) -> float | None:
+    """Run vector through loaded model; return human probability or None if no model."""
+    if model is None or scaler is None or len(vec_list) != input_size:
+        return None
+    arr = np.array(vec_list, dtype=np.float32).reshape(1, -1)
+    arr[:, -1] = np.clip(arr[:, -1], 0, 300)
+    arr = scaler.transform(arr)
+    t = torch.tensor(arr, dtype=torch.float32).to(device)
+    with torch.no_grad():
+        return model(t).item()
+
+
+def _make_demo_bot_vector(human_vectors: list, strong: bool = False) -> list:
+    """Generate a single synthetic bot vector with noise. strong=True for more bot-like."""
+    base = np.array(human_vectors[np.random.randint(len(human_vectors))]).copy()
+    if strong:
+        # Stronger noise so model reliably classifies as bot
+        base += np.random.normal(0, 0.08, len(base))
+        base[-3] += np.random.normal(0, 0.15)
+        base[-2] += np.random.normal(0, 0.12)
+        base[-1] += np.random.randint(-25, 25)
+    else:
+        base += np.random.normal(0, 0.015, len(base))
+        base[-3] += np.random.normal(0, 0.03)
+        base[-2] += np.random.normal(0, 0.02)
+        base[-1] += np.random.randint(-6, 6)
+    base[-1] = np.clip(base[-1], 0, 300)
+    return base.tolist()
+
+
 @app.get("/demo_bot_vector")
 def get_demo_bot_vector():
-    """Return a single bot-like session vector so the frontend can call /verify and show a 'Bot' result for demos."""
+    """Return a session vector that the model classifies as Bot (for demos)."""
     if not os.path.exists(DATASET_PATH):
         raise HTTPException(status_code=400, detail="No dataset found. Collect human samples first.")
 
@@ -207,16 +237,39 @@ def get_demo_bot_vector():
     if len(human_vectors) == 0:
         raise HTTPException(status_code=400, detail="No human samples. Use 'Collect Human Training Sample' first.")
 
-    # Prefer an existing bot vector (trained on); otherwise generate one
+    # If model is loaded, return a vector that scores as bot (prob < 0.5)
+    if model is not None and scaler is not None:
+        # Try existing bot vectors first (they were used in training)
+        for _ in range(min(20, max(len(bot_vectors), 1))):
+            if bot_vectors:
+                vec = bot_vectors[np.random.randint(len(bot_vectors))]
+            else:
+                vec = _make_demo_bot_vector(human_vectors, strong=False)
+            prob = _predict_probability(vec)
+            if prob is not None and prob < 0.5:
+                return {"session_vector": vec}
+
+        # Try stronger synthetic bot vectors
+        for _ in range(30):
+            vec = _make_demo_bot_vector(human_vectors, strong=True)
+            prob = _predict_probability(vec)
+            if prob is not None and prob < 0.5:
+                return {"session_vector": vec}
+
+        # Fallback: return vector with lowest prob among a few attempts
+        best_vec = _make_demo_bot_vector(human_vectors, strong=True)
+        best_prob = _predict_probability(best_vec) or 1.0
+        for _ in range(15):
+            cand = _make_demo_bot_vector(human_vectors, strong=True)
+            p = _predict_probability(cand)
+            if p is not None and p < best_prob:
+                best_prob = p
+                best_vec = cand
+        return {"session_vector": best_vec}
+
+    # No model: return any bot-like vector for display
     if bot_vectors:
         vec = bot_vectors[np.random.randint(len(bot_vectors))]
     else:
-        base = np.array(human_vectors[np.random.randint(len(human_vectors))]).copy()
-        base += np.random.normal(0, 0.015, len(base))
-        base[-3] += np.random.normal(0, 0.03)
-        base[-2] += np.random.normal(0, 0.02)
-        base[-1] += np.random.randint(-6, 6)
-        base[-1] = np.clip(base[-1], 0, 300)
-        vec = base.tolist()
-
+        vec = _make_demo_bot_vector(human_vectors, strong=True)
     return {"session_vector": vec}
