@@ -1,4 +1,5 @@
 import json
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,11 +9,16 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, roc_auc_score
 import joblib
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATASET_PATH = os.path.join(BASE_DIR, "dataset.json")
+MODEL_PATH = os.path.join(BASE_DIR, "luma_model.pth")
+SCALER_PATH = os.path.join(BASE_DIR, "scaler.pkl")
+
 # ===============================
 # 1️⃣ Load Labeled Dataset
 # ===============================
 
-with open("dataset.json", "r") as f:
+with open(DATASET_PATH, "r", encoding="utf-8") as f:
     dataset = json.load(f)
 
 X = []
@@ -31,6 +37,11 @@ X[:, -1] = np.clip(X[:, -1], 0, 300)
 print("Total samples:", len(X))
 print("Human samples:", sum(y == 1))
 print("Bot samples:", sum(y == 0))
+
+if len(X) < 2:
+    raise SystemExit("Need at least 2 samples to train. Collect more data.")
+if len(np.unique(y)) < 2:
+    raise SystemExit("Need both human (1) and bot (0) labels. Add bot data via /generate_bot_data or collect both.")
 
 # ===============================
 # 2️⃣ Normalize Features
@@ -108,10 +119,10 @@ with torch.no_grad():
 y_true = y_test.numpy()
 
 acc = accuracy_score(y_true, preds)
-precision = precision_score(y_true, preds)
-recall = recall_score(y_true, preds)
-f1 = f1_score(y_true, preds)
-auc = roc_auc_score(y_true, probs)
+precision = precision_score(y_true, preds, zero_division=0)
+recall = recall_score(y_true, preds, zero_division=0)
+f1 = f1_score(y_true, preds, zero_division=0)
+auc = roc_auc_score(y_true, probs) if len(np.unique(y_true)) > 1 else 0.0
 cm = confusion_matrix(y_true, preds)
 
 print("\n===== MODEL EVALUATION =====")
@@ -127,8 +138,8 @@ print(cm)
 # 7️⃣ Save Model + Scaler
 # ===============================
 
-torch.save(model.state_dict(), "luma_model.pth")
-joblib.dump(scaler, "scaler.pkl")
+torch.save(model.state_dict(), MODEL_PATH)
+joblib.dump(scaler, SCALER_PATH)
 
 print("\nTraining complete.")
 print("Model saved as luma_model.pth")

@@ -68,10 +68,26 @@ function App() {
   const stopCamera = () => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
-      videoRef.current.srcObject = null;
-      setCameraOn(false);
+      streamRef.current = null;
     }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setCameraOn(false);
   };
+
+  // ---------- Cleanup camera on unmount ----------
+  useEffect(() => {
+    return () => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((track) => track.stop());
+        streamRef.current = null;
+      }
+      if (videoRef.current) {
+        videoRef.current.srcObject = null;
+      }
+    };
+  }, []);
 
   // ---------- Keystroke Capture ----------
   useEffect(() => {
@@ -133,6 +149,30 @@ function App() {
       setResult(response.data);
     } catch (error) {
       console.error("Backend error:", error);
+      setResult(null);
+      alert("Verification failed. Is the backend running at http://127.0.0.1:8000?");
+    }
+  };
+
+  // ---------- Demo: Show bot result (for invigilator / presentation) ----------
+  const handleDemoBot = async () => {
+    try {
+      const vecRes = await axios.get("http://127.0.0.1:8000/demo_bot_vector");
+      const sessionVector = vecRes.data.session_vector;
+      const response = await axios.post(
+        "http://127.0.0.1:8000/verify",
+        {
+          session_vector: sessionVector,
+          content: "demo-bot-example",
+        }
+      );
+      setResult(response.data);
+    } catch (error) {
+      console.error("Demo bot error:", error);
+      setResult(null);
+      alert(
+        "Could not run bot demo. Ensure backend is running and you have at least one human sample collected (then train the model)."
+      );
     }
   };
 
@@ -147,13 +187,14 @@ function App() {
         {
           session_vector: sessionVector,
           content: "training",
-          label: 1,  // ✅ Human label
+          label: 1,  // Human label
         }
       );
 
       alert("Human session stored successfully!");
     } catch (error) {
       console.error("Collect error:", error);
+      alert("Failed to store session. Is the backend running?");
     }
   };
 
@@ -219,11 +260,20 @@ function App() {
           Collect Human Training Sample
         </button>
 
+        <button
+          onClick={handleDemoBot}
+          className="mt-3 w-full bg-amber-600 hover:bg-amber-500 p-3 rounded-lg font-semibold"
+        >
+          Demo: Show bot result
+        </button>
+
         {result && (
           <div className="mt-6 bg-gray-900 p-4 rounded-lg text-sm break-all">
             <p>
               <strong>Human Probability:</strong>{" "}
-              {result.human_probability.toFixed(3)}
+              {typeof result.human_probability === "number"
+                ? result.human_probability.toFixed(3)
+                : "—"}
             </p>
 
             <p className="mt-3 text-lg font-bold">
@@ -236,7 +286,7 @@ function App() {
             </p>
 
             <p className="mt-4">
-              <strong>Hash:</strong> {result.hash}
+              <strong>Hash:</strong> {result.hash ?? "—"}
             </p>
           </div>
         )}
