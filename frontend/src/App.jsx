@@ -2,6 +2,74 @@ import { useState, useRef, useEffect } from "react";
 import axios from "axios";
 import { FaceMesh } from "@mediapipe/face_mesh";
 import { Camera } from "@mediapipe/camera_utils";
+import { Hands } from "@mediapipe/hands";
+
+// Eye Aspect Ratio (EAR): lower = more closed. Standard MediaPipe Face Mesh indices.
+function getEAR(landmarks) {
+  const d = (a, b) =>
+    Math.hypot(landmarks[a].x - landmarks[b].x, landmarks[a].y - landmarks[b].y);
+  
+  // Left eye: vertical pairs (159-145, 158-153), horizontal (33-133)
+  const leftVert1 = d(159, 145);
+  const leftVert2 = d(158, 153);
+  const leftHoriz = d(33, 133) || 0.001;
+  const earLeft = (leftVert1 + leftVert2) / (2 * leftHoriz);
+  
+  // Right eye: vertical pairs (386-374, 385-380), horizontal (362-263)
+  const rightVert1 = d(386, 374);
+  const rightVert2 = d(385, 380);
+  const rightHoriz = d(362, 263) || 0.001;
+  const earRight = (rightVert1 + rightVert2) / (2 * rightHoriz);
+  
+  return (earLeft + earRight) / 2;
+}
+
+const EAR_CLOSED = 0.22;  // More lenient threshold
+const EAR_OPEN = 0.28;    // Higher threshold to ensure eyes fully open
+const BLINK_COOLDOWN_MS = 300;  // Shorter cooldown for faster detection
+
+// Count extended fingers from MediaPipe Hands (21 landmarks). Improved algorithm.
+function countExtendedFingers(landmarks) {
+  if (!landmarks || landmarks.length < 21) return 0;
+  let count = 0;
+  
+  // Four fingers: tip must be above PIP (lower y = higher on screen)
+  // Also check tip is above MCP for more accuracy
+  const fingerChecks = [
+    { tip: 8, pip: 6, mcp: 5 },   // Index
+    { tip: 12, pip: 10, mcp: 9 }, // Middle
+    { tip: 16, pip: 14, mcp: 13 }, // Ring
+    { tip: 20, pip: 18, mcp: 17 }, // Pinky
+  ];
+  
+  for (const { tip, pip, mcp } of fingerChecks) {
+    const tipY = landmarks[tip].y;
+    const pipY = landmarks[pip].y;
+    const mcpY = landmarks[mcp].y;
+    // Extended if tip is above both PIP and MCP
+    if (tipY < pipY && tipY < mcpY) {
+      count++;
+    }
+  }
+  
+  // Thumb: check if tip (4) is extended outward from hand
+  // Compare tip to IP (3) and MCP (2) - thumb extended if tip is farther from wrist
+  const wrist = landmarks[0];
+  const thumbTip = landmarks[4];
+  const thumbIp = landmarks[3];
+  const thumbMcp = landmarks[2];
+  
+  const dTip = Math.hypot(thumbTip.x - wrist.x, thumbTip.y - wrist.y);
+  const dIp = Math.hypot(thumbIp.x - wrist.x, thumbIp.y - wrist.y);
+  const dMcp = Math.hypot(thumbMcp.x - wrist.x, thumbMcp.y - wrist.y);
+  
+  // Thumb extended if tip is significantly farther than IP/MCP
+  if (dTip > dIp * 1.15 && dTip > dMcp * 1.2) {
+    count++;
+  }
+  
+  return Math.min(5, Math.max(0, count));
+}
 
 function App() {
   const [content, setContent] = useState("");
@@ -13,9 +81,32 @@ function App() {
   const [toast, setToast] = useState({ show: false, message: "", type: "success" });
   const [faceDetected, setFaceDetected] = useState(false);
 
+  // Liveness: require blink (and optional movement) before verify/collect
+  const [livenessActive, setLivenessActive] = useState(false);
+  const [livenessCount, setLivenessCount] = useState(0);
+  const [livenessRequired, setLivenessRequired] = useState(2);
+  const [livenessPrompt, setLivenessPrompt] = useState("");
+  const [livenessChallengeType, setLivenessChallengeType] = useState("blink"); // 'blink' | 'fingers'
+  const livenessRef = useRef({
+    active: false,
+    required: 2,
+    count: 0,
+    eyesClosed: false,
+    lastBlinkTime: 0,
+    onComplete: null,
+    challengeType: null, // 'blink' | 'fingers'
+    // For finger stability check
+    fingerCountHistory: [],
+    fingerStableSince: null,
+  });
+  const setLivenessCountRef = useRef(() => {});
+
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const faceMeshRef = useRef(null);
+  const handsRef = useRef(null);
+  const [fingersShown, setFingersShown] = useState(0);
+  const setFingersShownRef = useRef(() => {});
 
   // ---------- Start Camera ----------
   const startCamera = async () => {
@@ -37,6 +128,49 @@ function App() {
         minTrackingConfidence: 0.5,
       });
 
+      const hands = new Hands({
+        locateFile: (file) =>
+          `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
+      });
+      hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 0,
+        minDetectionConfidence: 0.6,
+        minTrackingConfidence: 0.5,
+      });
+      hands.onResults((results) => {
+        const l = livenessRef.current;
+        if (!l.active || l.challengeType !== "fingers") return;
+        if (results.multiHandLandmarks?.length > 0) {
+          const count = countExtendedFingers(results.multiHandLandmarks[0]);
+          setFingersShownRef.current?.(count);
+          
+          // Stability check: require count to match required for 500ms
+          const now = Date.now();
+          if (count === l.required) {
+            if (!l.fingerStableSince) {
+              l.fingerStableSince = now;
+            } else if (now - l.fingerStableSince >= 500) {
+              // Stable for 500ms - complete!
+              l.active = false;
+              l.challengeType = null;
+              l.fingerStableSince = null;
+              l.fingerCountHistory = [];
+              const done = l.onComplete;
+              l.onComplete = null;
+              if (done) done();
+            }
+          } else {
+            // Count doesn't match - reset stability timer
+            l.fingerStableSince = null;
+          }
+        } else {
+          // No hand detected - reset
+          l.fingerStableSince = null;
+        }
+      });
+      handsRef.current = hands;
+
       faceMesh.onResults((results) => {
         if (results.multiFaceLandmarks?.length > 0) {
           const landmarks = results.multiFaceLandmarks[0];
@@ -50,6 +184,37 @@ function App() {
 
           setFaceVector(vector);
           setFaceDetected(true);
+
+          // Liveness: blink detection when challenge is active
+          const l = livenessRef.current;
+          if (l.active && l.challengeType === "blink" && l.required > 0) {
+            try {
+              const ear = getEAR(landmarks);
+              const now = Date.now();
+              
+              // Detect eye closure
+              if (ear < EAR_CLOSED && !l.eyesClosed) {
+                l.eyesClosed = true;
+              }
+              // Detect eye opening after closure (blink complete)
+              else if (ear >= EAR_OPEN && l.eyesClosed && now - l.lastBlinkTime > BLINK_COOLDOWN_MS) {
+                l.eyesClosed = false;
+                l.lastBlinkTime = now;
+                l.count += 1;
+                setLivenessCountRef.current?.(l.count);
+                
+                if (l.count >= l.required) {
+                  l.active = false;
+                  l.challengeType = null;
+                  const done = l.onComplete;
+                  l.onComplete = null;
+                  if (done) done();
+                }
+              }
+            } catch (e) {
+              console.error("Blink detection error:", e);
+            }
+          }
         } else {
           setFaceDetected(false);
         }
@@ -58,6 +223,10 @@ function App() {
       const camera = new Camera(videoRef.current, {
         onFrame: async () => {
           await faceMesh.send({ image: videoRef.current });
+          const l = livenessRef.current;
+          if (l.active && l.challengeType === "fingers" && handsRef.current) {
+            await handsRef.current.send({ image: videoRef.current });
+          }
         },
         width: 640,
         height: 480,
@@ -115,12 +284,18 @@ function App() {
     setTimeout(() => setToast({ show: false, message: "", type: "success" }), 3000);
   };
 
-  // ---------- Reset Form (Auto-refresh) ----------
+  // ---------- Reset Form ----------
   const resetForm = () => {
     setContent("");
     setKeystrokes([]);
     setResult(null);
   };
+
+  // Keep refs in sync for liveness callbacks
+  useEffect(() => {
+    setLivenessCountRef.current = setLivenessCount;
+    setFingersShownRef.current = setFingersShown;
+  }, []);
 
   // ---------- Build Session Vector ----------
   const buildSessionVector = () => {
@@ -155,12 +330,12 @@ function App() {
     return [...faceVector, ...typingVector]; // 103 features
   };
 
-  // ---------- Verify ----------
-  const handleVerify = async () => {
+  // ---------- Run Verify (after liveness) ----------
+  const runVerify = async () => {
     const sessionVector = buildSessionVector();
     if (!sessionVector) return;
 
-    setLoading({ ...loading, verify: true });
+    setLoading((prev) => ({ ...prev, verify: true }));
     try {
       const response = await axios.post(
         "http://127.0.0.1:8000/verify",
@@ -177,8 +352,77 @@ function App() {
       setResult(null);
       showToast("Verification failed. Is the backend running at http://127.0.0.1:8000?", "error");
     } finally {
-      setLoading({ ...loading, verify: false });
+      setLoading((prev) => ({ ...prev, verify: false }));
     }
+  };
+
+  const startLiveness = (onComplete) => {
+    // More varied randomization: 40% blink, 60% fingers (fingers are more reliable)
+    // Also vary blink count (1-3) and finger count (1-5)
+    const rand = Math.random();
+    
+    if (rand < 0.4) {
+      // Blink challenge: 1-3 blinks (weighted toward 2)
+      const blinkOptions = [1, 2, 2, 2, 3]; // More 2s for common case
+      const required = blinkOptions[Math.floor(Math.random() * blinkOptions.length)];
+      setLivenessRequired(required);
+      setLivenessCount(0);
+      setLivenessPrompt(`Blink ${required} time${required === 1 ? "" : "s"} to prove you're live (not a photo)`);
+      setLivenessChallengeType("blink");
+      setLivenessActive(true);
+      livenessRef.current = {
+        active: true,
+        required,
+        count: 0,
+        eyesClosed: false,
+        lastBlinkTime: 0,
+        onComplete,
+        challengeType: "blink",
+        fingerCountHistory: [],
+        fingerStableSince: null,
+      };
+    } else {
+      // Finger challenge: 1-5 fingers (weighted toward 2-4)
+      const fingerOptions = [1, 2, 2, 3, 3, 3, 4, 4, 5]; // More 2-4s
+      const required = fingerOptions[Math.floor(Math.random() * fingerOptions.length)];
+      setLivenessRequired(required);
+      setFingersShown(0);
+      setLivenessCount(0);
+      setLivenessPrompt(`Show ${required} finger${required === 1 ? "" : "s"} to the camera`);
+      setLivenessChallengeType("fingers");
+      setLivenessActive(true);
+      livenessRef.current = {
+        active: true,
+        required,
+        count: 0,
+        eyesClosed: false,
+        lastBlinkTime: 0,
+        onComplete,
+        challengeType: "fingers",
+        fingerCountHistory: [],
+        fingerStableSince: null,
+      };
+    }
+  };
+
+  // ---------- Verify (starts liveness first) ----------
+  const handleVerify = () => {
+    if (!cameraOn || !faceDetected) {
+      showToast("Turn on the camera and ensure your face is detected first.", "error");
+      return;
+    }
+    if (keystrokes.length < 2) {
+      showToast("Type at least a few keystrokes before verifying.", "error");
+      return;
+    }
+    if (buildSessionVector() == null) return;
+
+    startLiveness(() => {
+      setLivenessActive(false);
+      setLivenessCount(0);
+      setFingersShown(0);
+      runVerify();
+    });
   };
 
   // ---------- Demo: Show bot result (for invigilator / presentation) ----------
@@ -208,19 +452,19 @@ function App() {
     }
   };
 
-  // ---------- Collect Human Training Sample ----------
-  const handleCollect = async () => {
+  // ---------- Run Collect (after liveness) ----------
+  const runCollect = async () => {
     const sessionVector = buildSessionVector();
     if (!sessionVector) return;
 
-    setLoading({ ...loading, collect: true });
+    setLoading((prev) => ({ ...prev, collect: true }));
     try {
       await axios.post(
         "http://127.0.0.1:8000/collect",
         {
           session_vector: sessionVector,
           content: "training",
-          label: 1,  // Human label
+          label: 1,
         }
       );
 
@@ -229,8 +473,39 @@ function App() {
       console.error("Collect error:", error);
       showToast("Failed to store session. Is the backend running?", "error");
     } finally {
-      setLoading({ ...loading, collect: false });
+      setLoading((prev) => ({ ...prev, collect: false }));
     }
+  };
+
+  // ---------- Collect (starts liveness first) ----------
+  const handleCollect = () => {
+    if (!cameraOn || !faceDetected) {
+      showToast("Turn on the camera and ensure your face is detected first.", "error");
+      return;
+    }
+    if (keystrokes.length < 2) {
+      showToast("Type at least a few keystrokes before collecting.", "error");
+      return;
+    }
+    if (buildSessionVector() == null) return;
+
+    startLiveness(() => {
+      setLivenessActive(false);
+      setLivenessCount(0);
+      setFingersShown(0);
+      runCollect();
+    });
+  };
+
+  const cancelLiveness = () => {
+    livenessRef.current.active = false;
+    livenessRef.current.onComplete = null;
+    livenessRef.current.challengeType = null;
+    livenessRef.current.fingerStableSince = null;
+    livenessRef.current.fingerCountHistory = [];
+    setLivenessActive(false);
+    setLivenessCount(0);
+    setFingersShown(0);
   };
 
   // ---------- Keyboard Shortcuts ----------
@@ -273,6 +548,61 @@ function App() {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-black text-white flex flex-col items-center justify-center p-4 sm:p-6">
+      {/* Liveness check overlay */}
+      {livenessActive && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
+          <div className="bg-gray-800 border border-gray-600 rounded-2xl p-8 max-w-md w-full shadow-2xl text-center animate-fade-in">
+            <h3 className="text-xl font-bold text-white mb-2">Liveness check</h3>
+            <p className="text-gray-300 mb-1">We need to confirm you’re not a photo or screen.</p>
+            {livenessChallengeType === "fingers" && (
+              <div className="text-6xl font-bold text-amber-400 my-4">{livenessRequired}</div>
+            )}
+            <p className="text-amber-400 font-semibold mb-6">{livenessPrompt}</p>
+            {livenessChallengeType === "blink" && (
+              <div className="mb-6">
+                <div className="text-4xl font-bold text-blue-400 mb-1">
+                  {livenessCount} / {livenessRequired}
+                </div>
+                <div className="text-sm text-gray-400">Blinks detected</div>
+                {livenessCount < livenessRequired && (
+                  <div className="mt-2 text-xs text-gray-500">
+                    👁️ Blink naturally - close and open your eyes
+                  </div>
+                )}
+              </div>
+            )}
+            {livenessChallengeType === "fingers" && (
+              <div className="mb-6">
+                <div className="text-4xl font-bold text-amber-400 mb-1">
+                  {fingersShown} / {livenessRequired}
+                </div>
+                <div className="text-sm text-gray-400">Fingers shown</div>
+                {fingersShown === livenessRequired && (
+                  <div className="mt-2 text-xs text-green-400 animate-pulse">
+                    ✓ Hold steady for a moment...
+                  </div>
+                )}
+                {fingersShown !== livenessRequired && fingersShown > 0 && (
+                  <div className="mt-2 text-xs text-yellow-400">
+                    Adjust to show {livenessRequired} finger{livenessRequired === 1 ? "" : "s"}
+                  </div>
+                )}
+              </div>
+            )}
+            <p className="text-sm text-gray-500 mb-6">
+              Look at the camera and perform the action above.
+            </p>
+            <button
+              type="button"
+              onClick={cancelLiveness}
+              className="px-4 py-2 rounded-lg border border-gray-500 text-gray-300 hover:bg-gray-700"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Toast Notification */}
       {toast.show && (
         <div
