@@ -4,71 +4,74 @@ import { FaceMesh } from "@mediapipe/face_mesh";
 import { Camera } from "@mediapipe/camera_utils";
 import { Hands } from "@mediapipe/hands";
 
-// Eye Aspect Ratio (EAR): lower = more closed. Standard MediaPipe Face Mesh indices.
+// Eye Aspect Ratio (EAR): lower = more closed. Returns { left, right, avg }.
 function getEAR(landmarks) {
   const d = (a, b) =>
     Math.hypot(landmarks[a].x - landmarks[b].x, landmarks[a].y - landmarks[b].y);
-  
-  // Left eye: vertical pairs (159-145, 158-153), horizontal (33-133)
   const leftVert1 = d(159, 145);
   const leftVert2 = d(158, 153);
   const leftHoriz = d(33, 133) || 0.001;
   const earLeft = (leftVert1 + leftVert2) / (2 * leftHoriz);
-  
-  // Right eye: vertical pairs (386-374, 385-380), horizontal (362-263)
   const rightVert1 = d(386, 374);
   const rightVert2 = d(385, 380);
   const rightHoriz = d(362, 263) || 0.001;
   const earRight = (rightVert1 + rightVert2) / (2 * rightHoriz);
-  
-  return (earLeft + earRight) / 2;
+  return { left: earLeft, right: earRight, avg: (earLeft + earRight) / 2 };
 }
 
-const EAR_CLOSED = 0.22;  // More lenient threshold
-const EAR_OPEN = 0.28;    // Higher threshold to ensure eyes fully open
-const BLINK_COOLDOWN_MS = 300;  // Shorter cooldown for faster detection
+const EAR_CLOSED = 0.20;   // Eyes considered closed
+const EAR_OPEN = 0.28;     // Eyes considered open (higher = stricter)
+const BLINK_COOLDOWN_MS = 350;  // Min ms between blinks
+const EAR_SMOOTH_SAMPLES = 7;   // Running average for stability
+const FINGER_SMOOTH_SAMPLES = 5; // Majority vote for finger count
+const FINGER_STABLE_MS = 500;   // Must hold correct count this long
 
-// Count extended fingers from MediaPipe Hands (21 landmarks). Improved algorithm.
+// Count extended fingers from MediaPipe Hands (21 landmarks). Robust algorithm.
 function countExtendedFingers(landmarks) {
   if (!landmarks || landmarks.length < 21) return 0;
   let count = 0;
-  
-  // Four fingers: tip must be above PIP (lower y = higher on screen)
-  // Also check tip is above MCP for more accuracy
-  const fingerChecks = [
-    { tip: 8, pip: 6, mcp: 5 },   // Index
-    { tip: 12, pip: 10, mcp: 9 }, // Middle
-    { tip: 16, pip: 14, mcp: 13 }, // Ring
-    { tip: 20, pip: 18, mcp: 17 }, // Pinky
+  const wrist = landmarks[0];
+
+  const dist = (a, b) =>
+    Math.hypot(landmarks[a].x - landmarks[b].x, landmarks[a].y - landmarks[b].y);
+
+  // Four fingers: tip farther from wrist than MCP = extended
+  const fingers = [
+    { tip: 8, mcp: 5 },   // Index
+    { tip: 12, mcp: 9 },  // Middle
+    { tip: 16, mcp: 13 }, // Ring
+    { tip: 20, mcp: 17 }, // Pinky
   ];
-  
-  for (const { tip, pip, mcp } of fingerChecks) {
-    const tipY = landmarks[tip].y;
-    const pipY = landmarks[pip].y;
-    const mcpY = landmarks[mcp].y;
-    // Extended if tip is above both PIP and MCP
-    if (tipY < pipY && tipY < mcpY) {
-      count++;
+  for (const { tip, mcp } of fingers) {
+    const dTip = dist(tip, 0);
+    const dMcp = dist(mcp, 0);
+    if (dTip > dMcp * 1.05) count++; // Tip extends beyond MCP
+  }
+
+  // Thumb: tip (4) farther from wrist than IP (3)
+  const dThumbTip = dist(4, 0);
+  const dThumbIp = dist(3, 0);
+  if (dThumbTip > dThumbIp * 1.08) count++;
+
+  return Math.min(5, Math.max(0, count));
+}
+
+// Majority vote from recent counts for stability
+function smoothFingerCount(history, required) {
+  if (history.length < FINGER_SMOOTH_SAMPLES) return null;
+  const recent = history.slice(-FINGER_SMOOTH_SAMPLES);
+  const counts = {};
+  for (const c of recent) {
+    counts[c] = (counts[c] || 0) + 1;
+  }
+  let best = -1, bestCount = 0;
+  for (const [c, n] of Object.entries(counts)) {
+    if (n > bestCount) {
+      bestCount = n;
+      best = parseInt(c, 10);
     }
   }
-  
-  // Thumb: check if tip (4) is extended outward from hand
-  // Compare tip to IP (3) and MCP (2) - thumb extended if tip is farther from wrist
-  const wrist = landmarks[0];
-  const thumbTip = landmarks[4];
-  const thumbIp = landmarks[3];
-  const thumbMcp = landmarks[2];
-  
-  const dTip = Math.hypot(thumbTip.x - wrist.x, thumbTip.y - wrist.y);
-  const dIp = Math.hypot(thumbIp.x - wrist.x, thumbIp.y - wrist.y);
-  const dMcp = Math.hypot(thumbMcp.x - wrist.x, thumbMcp.y - wrist.y);
-  
-  // Thumb extended if tip is significantly farther than IP/MCP
-  if (dTip > dIp * 1.15 && dTip > dMcp * 1.2) {
-    count++;
-  }
-  
-  return Math.min(5, Math.max(0, count));
+  return best === required ? best : null;
 }
 
 function App() {
@@ -94,10 +97,10 @@ function App() {
     eyesClosed: false,
     lastBlinkTime: 0,
     onComplete: null,
-    challengeType: null, // 'blink' | 'fingers'
-    // For finger stability check
+    challengeType: null,
     fingerCountHistory: [],
     fingerStableSince: null,
+    earHistory: [],
   });
   const setLivenessCountRef = useRef(() => {});
 
@@ -134,24 +137,25 @@ function App() {
       });
       hands.setOptions({
         maxNumHands: 1,
-        modelComplexity: 0,
-        minDetectionConfidence: 0.6,
-        minTrackingConfidence: 0.5,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.65,
+        minTrackingConfidence: 0.55,
       });
       hands.onResults((results) => {
         const l = livenessRef.current;
         if (!l.active || l.challengeType !== "fingers") return;
         if (results.multiHandLandmarks?.length > 0) {
           const count = countExtendedFingers(results.multiHandLandmarks[0]);
+          l.fingerCountHistory = (l.fingerCountHistory || []).slice(-FINGER_SMOOTH_SAMPLES);
+          l.fingerCountHistory.push(count);
           setFingersShownRef.current?.(count);
-          
-          // Stability check: require count to match required for 500ms
+
+          const smoothed = smoothFingerCount(l.fingerCountHistory, l.required);
           const now = Date.now();
-          if (count === l.required) {
+          if (smoothed !== null) {
             if (!l.fingerStableSince) {
               l.fingerStableSince = now;
-            } else if (now - l.fingerStableSince >= 500) {
-              // Stable for 500ms - complete!
+            } else if (now - l.fingerStableSince >= FINGER_STABLE_MS) {
               l.active = false;
               l.challengeType = null;
               l.fingerStableSince = null;
@@ -185,27 +189,36 @@ function App() {
           setFaceVector(vector);
           setFaceDetected(true);
 
-          // Liveness: blink detection when challenge is active
+          // Liveness: blink detection with smoothed EAR, both eyes must close
           const l = livenessRef.current;
           if (l.active && l.challengeType === "blink" && l.required > 0) {
             try {
-              const ear = getEAR(landmarks);
+              const raw = getEAR(landmarks);
+              l.earHistory = (l.earHistory || []).slice(-EAR_SMOOTH_SAMPLES);
+              l.earHistory.push(raw.avg);
+              const ear =
+                l.earHistory.length >= EAR_SMOOTH_SAMPLES
+                  ? l.earHistory.reduce((a, b) => a + b, 0) / l.earHistory.length
+                  : raw.avg;
+              const bothClosed = raw.left < EAR_CLOSED && raw.right < EAR_CLOSED;
+              const bothOpen = raw.left >= EAR_OPEN && raw.right >= EAR_OPEN;
               const now = Date.now();
-              
-              // Detect eye closure
-              if (ear < EAR_CLOSED && !l.eyesClosed) {
+
+              if (bothClosed && !l.eyesClosed) {
                 l.eyesClosed = true;
-              }
-              // Detect eye opening after closure (blink complete)
-              else if (ear >= EAR_OPEN && l.eyesClosed && now - l.lastBlinkTime > BLINK_COOLDOWN_MS) {
+              } else if (
+                bothOpen &&
+                l.eyesClosed &&
+                now - l.lastBlinkTime > BLINK_COOLDOWN_MS
+              ) {
                 l.eyesClosed = false;
                 l.lastBlinkTime = now;
                 l.count += 1;
                 setLivenessCountRef.current?.(l.count);
-                
                 if (l.count >= l.required) {
                   l.active = false;
                   l.challengeType = null;
+                  l.earHistory = [];
                   const done = l.onComplete;
                   l.onComplete = null;
                   if (done) done();
@@ -357,11 +370,8 @@ function App() {
   };
 
   const startLiveness = (onComplete) => {
-    // More varied randomization: 40% blink, 60% fingers (fingers are more reliable)
-    // Also vary blink count (1-3) and finger count (1-5)
     const rand = Math.random();
-    
-    if (rand < 0.4) {
+    if (rand < 0.5) {
       // Blink challenge: 1-3 blinks (weighted toward 2)
       const blinkOptions = [1, 2, 2, 2, 3]; // More 2s for common case
       const required = blinkOptions[Math.floor(Math.random() * blinkOptions.length)];
@@ -380,6 +390,7 @@ function App() {
         challengeType: "blink",
         fingerCountHistory: [],
         fingerStableSince: null,
+        earHistory: [],
       };
     } else {
       // Finger challenge: 1-5 fingers (weighted toward 2-4)
@@ -401,6 +412,7 @@ function App() {
         challengeType: "fingers",
         fingerCountHistory: [],
         fingerStableSince: null,
+        earHistory: [],
       };
     }
   };
@@ -547,55 +559,68 @@ function App() {
     : null;
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-black text-white flex flex-col items-center justify-center p-4 sm:p-6">
-      {/* Liveness check overlay */}
+    <div className="min-h-screen bg-[#0a0a0f] text-white flex flex-col items-center justify-center p-4 sm:p-6 relative overflow-hidden">
+      <div className="absolute inset-0 bg-[radial-gradient(ellipse_80%_50%_at_50%_-20%,rgba(34,211,238,0.15),transparent)]" />
+      <div className="absolute inset-0 bg-[radial-gradient(ellipse_60%_40%_at_80%_100%,rgba(167,139,250,0.12),transparent)]" />
+      <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-cyan-500/10 rounded-full blur-3xl animate-float" />
+      <div className="absolute bottom-1/4 right-1/4 w-80 h-80 bg-violet-500/10 rounded-full blur-3xl animate-float" style={{ animationDelay: "-3s" }} />
+
+      {/* Liveness overlay */}
       {livenessActive && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/80 backdrop-blur-sm p-4">
-          <div className="bg-gray-800 border border-gray-600 rounded-2xl p-8 max-w-md w-full shadow-2xl text-center animate-fade-in">
-            <h3 className="text-xl font-bold text-white mb-2">Liveness check</h3>
-            <p className="text-gray-300 mb-1">We need to confirm you’re not a photo or screen.</p>
+        <div className="fixed inset-0 z-40 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xl animate-fade-in">
+          <div className="bg-[#16161f]/95 backdrop-blur-2xl border border-white/10 rounded-3xl p-8 sm:p-10 max-w-md w-full text-center animate-fade-in-scale shadow-2xl">
+            <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-cyan-500/15 border border-cyan-500/30 mb-6 animate-liveness-pulse">
+              <span className="text-2xl">{livenessChallengeType === "blink" ? "👁" : "✋"}</span>
+            </div>
+            <h3 className="font-display text-2xl font-bold text-white mb-1">Liveness check</h3>
+            <p className="text-white/60 text-sm mb-6">Prove you are live — not a photo or screen</p>
             {livenessChallengeType === "fingers" && (
-              <div className="text-6xl font-bold text-amber-400 my-4">{livenessRequired}</div>
+              <div className="text-7xl font-extrabold bg-gradient-to-r from-cyan-400 via-violet-400 to-fuchsia-400 bg-clip-text text-transparent my-6">
+                {livenessRequired}
+              </div>
             )}
-            <p className="text-amber-400 font-semibold mb-6">{livenessPrompt}</p>
+            <p className="text-cyan-400 font-semibold mb-6">{livenessPrompt}</p>
             {livenessChallengeType === "blink" && (
               <div className="mb-6">
-                <div className="text-4xl font-bold text-blue-400 mb-1">
-                  {livenessCount} / {livenessRequired}
+                <div className="flex items-center justify-center gap-2 mb-2">
+                  {Array.from({ length: livenessRequired }).map((_, i) => (
+                    <div
+                      key={i}
+                      className={`w-3 h-3 rounded-full transition-all duration-300 ${i < livenessCount ? "bg-cyan-400 scale-110 shadow-[0_0_20px_rgba(34,211,238,0.5)]" : "bg-white/20"}`}
+                    />
+                  ))}
                 </div>
-                <div className="text-sm text-gray-400">Blinks detected</div>
+                <div className="text-2xl font-bold text-white">{livenessCount} / {livenessRequired}</div>
+                <div className="text-sm text-white/50 mt-1">Blinks detected</div>
                 {livenessCount < livenessRequired && (
-                  <div className="mt-2 text-xs text-gray-500">
-                    👁️ Blink naturally - close and open your eyes
-                  </div>
+                  <p className="mt-3 text-xs text-white/40">Blink naturally — close then open your eyes</p>
                 )}
               </div>
             )}
             {livenessChallengeType === "fingers" && (
               <div className="mb-6">
-                <div className="text-4xl font-bold text-amber-400 mb-1">
-                  {fingersShown} / {livenessRequired}
+                <div className="flex items-center justify-center gap-2 mb-2">
+                  {Array.from({ length: 5 }).map((_, i) => (
+                    <div
+                      key={i}
+                      className={`w-2 h-8 rounded-full transition-all duration-300 ${i < fingersShown ? "bg-amber-400/90" : "bg-white/15"}`}
+                    />
+                  ))}
                 </div>
-                <div className="text-sm text-gray-400">Fingers shown</div>
+                <div className="text-2xl font-bold text-white">{fingersShown} / {livenessRequired}</div>
+                <div className="text-sm text-white/50 mt-1">Fingers shown</div>
                 {fingersShown === livenessRequired && (
-                  <div className="mt-2 text-xs text-green-400 animate-pulse">
-                    ✓ Hold steady for a moment...
-                  </div>
+                  <p className="mt-3 text-xs text-emerald-400 animate-pulse">Hold steady...</p>
                 )}
                 {fingersShown !== livenessRequired && fingersShown > 0 && (
-                  <div className="mt-2 text-xs text-yellow-400">
-                    Adjust to show {livenessRequired} finger{livenessRequired === 1 ? "" : "s"}
-                  </div>
+                  <p className="mt-3 text-xs text-amber-400/90">Adjust to show {livenessRequired} finger{livenessRequired === 1 ? "" : "s"}</p>
                 )}
               </div>
             )}
-            <p className="text-sm text-gray-500 mb-6">
-              Look at the camera and perform the action above.
-            </p>
             <button
               type="button"
               onClick={cancelLiveness}
-              className="px-4 py-2 rounded-lg border border-gray-500 text-gray-300 hover:bg-gray-700"
+              className="px-5 py-2.5 rounded-xl border border-white/20 text-white/70 hover:bg-white/10 hover:text-white transition-all duration-200"
             >
               Cancel
             </button>
@@ -603,187 +628,158 @@ function App() {
         </div>
       )}
 
-      {/* Toast Notification */}
       {toast.show && (
         <div
-          className={`fixed top-4 right-4 z-50 px-6 py-3 rounded-lg shadow-xl backdrop-blur-md border transition-all duration-300 ${
-            toast.type === "success"
-              ? "bg-green-500/90 border-green-400 text-white"
-              : "bg-red-500/90 border-red-400 text-white"
-          } animate-slide-in`}
+          className={`fixed top-6 right-6 z-50 px-5 py-3 rounded-2xl shadow-2xl backdrop-blur-xl border animate-slide-in flex items-center gap-3 ${
+            toast.type === "success" ? "bg-emerald-500/90 border-emerald-400/50 text-white" : "bg-red-500/90 border-red-400/50 text-white"
+          }`}
         >
-          <div className="flex items-center gap-2">
-            <span>{toast.type === "success" ? "✓" : "✗"}</span>
-            <span className="font-medium">{toast.message}</span>
-          </div>
+          <span className="text-lg">{toast.type === "success" ? "✓" : "✗"}</span>
+          <span className="font-medium">{toast.message}</span>
         </div>
       )}
 
-      <div className="bg-gray-800/70 backdrop-blur-xl shadow-2xl rounded-3xl p-6 sm:p-10 w-full max-w-2xl border border-gray-700/50 animate-fade-in">
-        <div className="text-center mb-6">
-          <h1 className="text-4xl sm:text-5xl font-bold mb-2 bg-gradient-to-r from-blue-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">
+      <div className="relative w-full max-w-2xl bg-[#16161f]/80 backdrop-blur-2xl rounded-3xl p-6 sm:p-10 border border-white/[0.06] shadow-2xl animate-fade-in">
+        <div className="text-center mb-8">
+          <h1 className="font-display text-4xl sm:text-5xl lg:text-6xl font-extrabold mb-3 bg-gradient-to-r from-cyan-400 via-violet-400 to-fuchsia-400 bg-clip-text text-transparent tracking-tight">
             LUMA-X
           </h1>
-          <p className="text-gray-400 text-sm sm:text-base">
-            Multi-Modal Human Presence Attestation
-          </p>
+          <p className="text-white/50 text-sm sm:text-base">Multi-Modal Human Presence Attestation</p>
         </div>
 
-        {/* Camera Section */}
         <div className="mb-6 flex flex-col items-center">
-          <div className="relative">
+          <div className="relative group">
+            <div className={`absolute -inset-1 rounded-2xl transition-all duration-500 ${faceDetected ? "bg-cyan-500/20 blur-sm" : "bg-white/5"}`} />
             <video
               ref={videoRef}
               autoPlay
               playsInline
-              className="rounded-xl border-2 border-gray-600 w-full max-w-xs shadow-lg"
+              className="relative rounded-2xl border border-white/10 w-full max-w-xs aspect-video object-cover shadow-2xl"
             />
             {cameraOn && (
-              <div className="absolute top-2 right-2 flex items-center gap-2">
-                <div
-                  className={`w-3 h-3 rounded-full ${
-                    faceDetected ? "bg-green-500 animate-pulse" : "bg-red-500"
-                  }`}
-                />
-                <span className="text-xs bg-black/50 px-2 py-1 rounded">
-                  {faceDetected ? "Face Detected" : "No Face"}
-                </span>
+              <div className="absolute top-3 right-3 flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/60 backdrop-blur-sm border border-white/10">
+                <div className={`w-2.5 h-2.5 rounded-full ${faceDetected ? "bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.6)] animate-pulse" : "bg-red-400"}`} />
+                <span className="text-xs font-medium text-white/90">{faceDetected ? "Face detected" : "No face"}</span>
               </div>
             )}
           </div>
-
-          <div className="flex gap-3 mt-4">
+          <div className="flex gap-3 mt-5">
             {!cameraOn ? (
               <button
                 onClick={startCamera}
-                className="bg-green-600 hover:bg-green-500 px-5 py-2.5 rounded-lg font-medium transition-all duration-200 hover:scale-105 active:scale-95 shadow-lg"
+                className="px-6 py-3 rounded-xl font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 hover:bg-emerald-500/30 hover:scale-[1.02] hover:-translate-y-0.5 active:scale-[0.98] transition-all duration-200"
               >
-                📷 Start Camera
+                Start camera
               </button>
             ) : (
               <button
                 onClick={stopCamera}
-                className="bg-red-600 hover:bg-red-500 px-5 py-2.5 rounded-lg font-medium transition-all duration-200 hover:scale-105 active:scale-95 shadow-lg"
+                className="px-6 py-3 rounded-xl font-semibold bg-red-500/20 text-red-400 border border-red-500/40 hover:bg-red-500/30 hover:scale-[1.02] hover:-translate-y-0.5 active:scale-[0.98] transition-all duration-200"
               >
-                ⏹️ Stop Camera
+                Stop camera
               </button>
             )}
           </div>
         </div>
 
-        {/* Typing Stats Display */}
         {typingStats && (
-          <div className="mb-4 p-3 bg-gray-900/50 rounded-lg border border-gray-700/50">
-            <div className="grid grid-cols-3 gap-2 text-xs sm:text-sm">
-              <div className="text-center">
-                <div className="text-gray-400">Keystrokes</div>
-                <div className="font-bold text-blue-400">{keystrokes.length}</div>
+          <div className="mb-5 p-4 rounded-2xl bg-white/[0.03] border border-white/[0.06] animate-fade-in">
+            <div className="grid grid-cols-3 gap-4 text-center">
+              <div>
+                <div className="text-xs text-white/40 font-medium uppercase tracking-wider">Keystrokes</div>
+                <div className="text-xl font-bold text-cyan-400">{keystrokes.length}</div>
               </div>
-              <div className="text-center">
-                <div className="text-gray-400">Mean Interval</div>
-                <div className="font-bold text-purple-400">{typingStats.mean}s</div>
+              <div>
+                <div className="text-xs text-white/40 font-medium uppercase tracking-wider">Mean</div>
+                <div className="text-xl font-bold text-violet-400">{typingStats.mean}s</div>
               </div>
-              <div className="text-center">
-                <div className="text-gray-400">Std Dev</div>
-                <div className="font-bold text-pink-400">{typingStats.std}s</div>
+              <div>
+                <div className="text-xs text-white/40 font-medium uppercase tracking-wider">Std</div>
+                <div className="text-xl font-bold text-fuchsia-400">{typingStats.std}s</div>
               </div>
             </div>
           </div>
         )}
 
         <textarea
-          className="w-full p-4 rounded-xl bg-gray-900/80 border border-gray-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-all duration-200 resize-none"
+          className="w-full p-4 rounded-2xl bg-white/[0.04] border border-white/10 placeholder:text-white/30 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 focus:border-cyan-500/30 transition-all duration-200 resize-none text-white"
           rows="4"
           placeholder="Type here to capture keystroke patterns..."
           value={content}
           onChange={(e) => setContent(e.target.value)}
         />
-
-        {keystrokes.length === 0 && (
-          <p className="mt-2 text-xs text-gray-500 text-center">
-            Start typing to capture keystroke data
-          </p>
-        )}
+        {keystrokes.length === 0 && <p className="mt-2 text-xs text-white/30 text-center">Start typing to capture data</p>}
 
         <div className="mt-6 space-y-3">
           <button
             onClick={handleVerify}
             disabled={loading.verify || !faceDetected || keystrokes.length < 2}
-            className="w-full bg-gradient-to-r from-blue-600 to-blue-500 hover:from-blue-500 hover:to-blue-400 disabled:from-gray-600 disabled:to-gray-600 disabled:cursor-not-allowed p-3.5 rounded-xl font-semibold transition-all duration-200 hover:scale-[1.02] active:scale-[0.98] shadow-lg flex items-center justify-center gap-2"
+            className="w-full py-4 rounded-2xl font-semibold flex items-center justify-center gap-3 bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/25 hover:shadow-[0_0_30px_-5px_rgba(34,211,238,0.4)] hover:scale-[1.02] hover:-translate-y-0.5 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:translate-y-0 transition-all duration-200"
           >
             {loading.verify ? (
               <>
-                <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                <div className="w-5 h-5 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin" />
                 Verifying...
               </>
             ) : (
               <>
-                🔍 Verify Human Presence
-                <span className="text-xs opacity-70 ml-auto">Ctrl+Enter</span>
+                <span>Verify human presence</span>
+                <span className="text-xs opacity-60">Ctrl+Enter</span>
               </>
             )}
           </button>
-
           <button
             onClick={handleCollect}
             disabled={loading.collect || !faceDetected || keystrokes.length < 2}
-            className="w-full bg-gradient-to-r from-purple-600 to-purple-500 hover:from-purple-500 hover:to-purple-400 disabled:from-gray-600 disabled:to-gray-600 disabled:cursor-not-allowed p-3.5 rounded-xl font-semibold transition-all duration-200 hover:scale-[1.02] active:scale-[0.98] shadow-lg flex items-center justify-center gap-2"
+            className="w-full py-4 rounded-2xl font-semibold flex items-center justify-center gap-3 bg-violet-500/15 text-violet-400 border border-violet-500/30 hover:bg-violet-500/25 hover:shadow-[0_0_30px_-5px_rgba(167,139,250,0.4)] hover:scale-[1.02] hover:-translate-y-0.5 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:translate-y-0 transition-all duration-200"
           >
             {loading.collect ? (
               <>
-                <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                <div className="w-5 h-5 border-2 border-violet-400 border-t-transparent rounded-full animate-spin" />
                 Collecting...
               </>
             ) : (
               <>
-                💾 Collect Human Training Sample
-                <span className="text-xs opacity-70 ml-auto">Ctrl+S</span>
+                <span>Collect human sample</span>
+                <span className="text-xs opacity-60">Ctrl+S</span>
               </>
             )}
           </button>
-
           <button
             onClick={handleDemoBot}
             disabled={loading.demo}
-            className="w-full bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 disabled:from-gray-600 disabled:to-gray-600 disabled:cursor-not-allowed p-3.5 rounded-xl font-semibold transition-all duration-200 hover:scale-[1.02] active:scale-[0.98] shadow-lg flex items-center justify-center gap-2"
+            className="w-full py-4 rounded-2xl font-semibold flex items-center justify-center gap-3 bg-amber-500/15 text-amber-400 border border-amber-500/30 hover:bg-amber-500/25 hover:scale-[1.02] hover:-translate-y-0.5 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:translate-y-0 transition-all duration-200"
           >
             {loading.demo ? (
-              <>
-                <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                Loading...
-              </>
+              <div className="w-5 h-5 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
             ) : (
-              <>
-                🤖 Demo: Show Bot Result
-              </>
+              "Demo: show bot result"
             )}
           </button>
-
           <button
             type="button"
             onClick={resetForm}
-            className="w-full mt-2 p-2.5 rounded-xl font-medium border border-gray-600 text-gray-300 hover:bg-gray-700/50 hover:border-gray-500 transition-all duration-200 flex items-center justify-center gap-2"
+            className="w-full py-3 rounded-2xl font-medium border border-white/15 text-white/50 hover:bg-white/5 hover:text-white/70 transition-all duration-200"
           >
-            🔄 Refresh (clear form & result)
+            Refresh
           </button>
         </div>
 
         {result && (
-          <div className="mt-6 bg-gradient-to-br from-gray-900 to-gray-800 p-5 rounded-xl border border-gray-700/50 animate-fade-in shadow-xl">
-            {/* Probability Bar */}
+          <div className="mt-8 p-6 rounded-2xl bg-white/[0.04] border border-white/10 animate-result-success shadow-xl" style={{ boxShadow: "0 0 0 1px rgba(255,255,255,0.05) inset" }}>
             {typeof result.human_probability === "number" && (
-              <div className="mb-4">
+              <div className="mb-5">
                 <div className="flex justify-between items-center mb-2">
-                  <span className="text-sm font-medium text-gray-300">Human Probability</span>
-                  <span className="text-lg font-bold text-blue-400">
+                  <span className="text-sm text-white/50 font-medium">Human probability</span>
+                  <span className="text-2xl font-bold text-cyan-400">
                     {(result.human_probability * 100).toFixed(1)}%
                   </span>
                 </div>
-                <div className="w-full bg-gray-700 rounded-full h-3 overflow-hidden">
+                <div className="w-full h-2 bg-white/10 rounded-full overflow-hidden">
                   <div
-                    className={`h-full transition-all duration-500 rounded-full ${
+                    className={`h-full rounded-full transition-all duration-700 ease-out ${
                       result.prediction === 1
-                        ? "bg-gradient-to-r from-green-500 to-green-400"
+                        ? "bg-gradient-to-r from-emerald-500 to-emerald-400"
                         : "bg-gradient-to-r from-red-500 to-red-400"
                     }`}
                     style={{ width: `${result.human_probability * 100}%` }}
@@ -791,30 +787,16 @@ function App() {
                 </div>
               </div>
             )}
-
-            {/* Prediction */}
-            <div className="text-center mb-4">
-              <div className="text-xs text-gray-400 mb-1">PREDICTION</div>
-              <div className={`text-2xl font-bold ${
-                result.prediction === 1 ? "text-green-400" : "text-red-400"
-              }`}>
-                {result.prediction === 1 ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <span>✅ Human Verified</span>
-                  </span>
-                ) : (
-                  <span className="flex items-center justify-center gap-2">
-                    <span>❌ Bot Detected</span>
-                  </span>
-                )}
+            <div className="text-center py-4">
+              <div className="text-xs text-white/40 uppercase tracking-widest mb-2">Prediction</div>
+              <div className={`text-2xl font-bold ${result.prediction === 1 ? "text-emerald-400" : "text-red-400"}`}>
+                {result.prediction === 1 ? "Human verified" : "Bot detected"}
               </div>
             </div>
-
-            {/* Hash */}
             {result.hash && (
-              <div className="pt-4 border-t border-gray-700">
-                <div className="text-xs text-gray-400 mb-1">VERIFICATION HASH</div>
-                <div className="text-xs font-mono break-all text-gray-300 bg-gray-900/50 p-2 rounded">
+              <div className="pt-4 border-t border-white/10">
+                <div className="text-xs text-white/40 uppercase tracking-wider mb-1">Verification hash</div>
+                <div className="text-xs font-mono break-all text-white/50 bg-black/30 p-3 rounded-xl">
                   {result.hash}
                 </div>
               </div>
