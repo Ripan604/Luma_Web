@@ -172,11 +172,6 @@ function App() {
 
       setResult(response.data);
       showToast("Verification completed successfully!", "success");
-      
-      // Auto-refresh after 2 seconds
-      setTimeout(() => {
-        resetForm();
-      }, 2000);
     } catch (error) {
       console.error("Backend error:", error);
       setResult(null);
@@ -201,11 +196,6 @@ function App() {
       );
       setResult(response.data);
       showToast("Bot demo completed!", "success");
-      
-      // Auto-refresh after 2 seconds
-      setTimeout(() => {
-        resetForm();
-      }, 2000);
     } catch (error) {
       console.error("Demo bot error:", error);
       setResult(null);
@@ -235,11 +225,6 @@ function App() {
       );
 
       showToast("Human session stored successfully! ✅", "success");
-      
-      // Auto-refresh after 1.5 seconds
-      setTimeout(() => {
-        resetForm();
-      }, 1500);
     } catch (error) {
       console.error("Collect error:", error);
       showToast("Failed to store session. Is the backend running?", "error");
