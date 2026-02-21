@@ -83,6 +83,23 @@ function App() {
   const [loading, setLoading] = useState({ verify: false, collect: false, demo: false });
   const [toast, setToast] = useState({ show: false, message: "", type: "success" });
   const [faceDetected, setFaceDetected] = useState(false);
+  const [theme, setTheme] = useState(() => {
+    if (typeof window === "undefined") return "dark";
+    const saved = window.localStorage.getItem("luma-theme");
+    if (saved === "dark" || saved === "light") return saved;
+    return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  });
+  const sceneRef = useRef(null);
+  const cardRef = useRef(null);
+  const particleCanvasRef = useRef(null);
+  const particleCtxRef = useRef(null);
+  const particlesRef = useRef([]);
+  const frameClockRef = useRef(0);
+  const reducedMotionRef = useRef(false);
+  const pointerTargetRef = useRef({ x: 0, y: 0, active: false });
+  const pointerCurrentRef = useRef({ x: 0, y: 0, active: false });
+  const pointerAnimRef = useRef(null);
+  const pointerMetaRef = useRef({ width: 1, height: 1 });
 
   // Liveness: require blink (and optional movement) before verify/collect
   const [livenessActive, setLivenessActive] = useState(false);
@@ -180,7 +197,7 @@ function App() {
           const landmarks = results.multiFaceLandmarks[0];
           let vector = [];
 
-          // 50 landmarks × (x,y) = 100 features
+          // 50 landmarks x (x,y) = 100 features
           for (let i = 0; i < 50; i++) {
             vector.push(landmarks[i].x);
             vector.push(landmarks[i].y);
@@ -276,6 +293,207 @@ function App() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    document.documentElement.setAttribute("data-theme", theme);
+    window.localStorage.setItem("luma-theme", theme);
+  }, [theme]);
+
+  // Pointer + particle interaction layer (no React frame updates)
+  useEffect(() => {
+    if (typeof window === "undefined") return undefined;
+
+    const palette =
+      theme === "light"
+        ? [
+            [14, 116, 144],
+            [79, 70, 229],
+            [217, 70, 239],
+            [15, 23, 42],
+          ]
+        : [
+            [34, 211, 238],
+            [56, 189, 248],
+            [167, 139, 250],
+            [232, 121, 249],
+          ];
+
+    const makeParticle = (width, height) => {
+      const color = palette[Math.floor(Math.random() * palette.length)];
+      return {
+        x: Math.random() * width,
+        y: Math.random() * height,
+        vx: (Math.random() - 0.5) * 0.35,
+        vy: (Math.random() - 0.5) * 0.35,
+        size: 1 + Math.random() * 2.4,
+        alpha: 0.22 + Math.random() * 0.46,
+        drift: 0.3 + Math.random() * 0.7,
+        phase: Math.random() * Math.PI * 2,
+        color,
+      };
+    };
+
+    const initializeParticles = () => {
+      const { width, height } = pointerMetaRef.current;
+      const count = reducedMotionRef.current ? 26 : width < 768 ? 48 : 84;
+      particlesRef.current = Array.from({ length: count }, () => makeParticle(width, height));
+    };
+
+    const configureCanvas = () => {
+      const canvas = particleCanvasRef.current;
+      if (!canvas) return;
+      const width = window.innerWidth || 1;
+      const height = window.innerHeight || 1;
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      pointerMetaRef.current = { width, height };
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      particleCtxRef.current = ctx;
+
+      if (pointerTargetRef.current.x === 0 && pointerTargetRef.current.y === 0) {
+        pointerTargetRef.current.x = width / 2;
+        pointerTargetRef.current.y = height / 2;
+        pointerCurrentRef.current.x = width / 2;
+        pointerCurrentRef.current.y = height / 2;
+      }
+    };
+
+    const onReduceMotion = (event) => {
+      reducedMotionRef.current = event.matches;
+      initializeParticles();
+    };
+
+    const prefersReducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    reducedMotionRef.current = prefersReducedMotion.matches;
+
+    const onMove = (event) => {
+      pointerTargetRef.current.x = event.clientX;
+      pointerTargetRef.current.y = event.clientY;
+      pointerTargetRef.current.active = true;
+    };
+
+    const onLeave = () => {
+      pointerTargetRef.current.active = false;
+    };
+
+    const onBurst = (event) => {
+      const { width, height } = pointerMetaRef.current;
+      for (let i = 0; i < 8; i++) {
+        const particle = makeParticle(width, height);
+        particle.x = event.clientX + (Math.random() - 0.5) * 28;
+        particle.y = event.clientY + (Math.random() - 0.5) * 28;
+        particle.vx = (Math.random() - 0.5) * 2.1;
+        particle.vy = (Math.random() - 0.5) * 2.1;
+        particlesRef.current.push(particle);
+      }
+      if (particlesRef.current.length > 120) {
+        particlesRef.current.splice(0, particlesRef.current.length - 120);
+      }
+    };
+
+    const animate = (timestamp) => {
+      const current = pointerCurrentRef.current;
+      const target = pointerTargetRef.current;
+      const { width, height } = pointerMetaRef.current;
+      const dt = Math.min((timestamp - (frameClockRef.current || timestamp)) / 16.67, 2.5);
+      frameClockRef.current = timestamp;
+
+      current.x += (target.x - current.x) * 0.12;
+      current.y += (target.y - current.y) * 0.12;
+      current.active = target.active;
+
+      const normX = ((current.x / width) - 0.5) * 2;
+      const normY = ((current.y / height) - 0.5) * 2;
+
+      if (cardRef.current) {
+        cardRef.current.style.setProperty("--tilt-x", `${(-normY * 4.5).toFixed(2)}`);
+        cardRef.current.style.setProperty("--tilt-y", `${(normX * 6.5).toFixed(2)}`);
+      }
+
+      const ctx = particleCtxRef.current;
+      if (ctx) {
+        ctx.clearRect(0, 0, width, height);
+        const particles = particlesRef.current;
+        const attractRadius = reducedMotionRef.current ? 120 : 190;
+
+        for (let i = 0; i < particles.length; i++) {
+          const p = particles[i];
+          const dx = current.x - p.x;
+          const dy = current.y - p.y;
+          const dist = Math.hypot(dx, dy) || 1;
+
+          if (current.active && dist < attractRadius) {
+            const force = ((attractRadius - dist) / attractRadius) * 0.08 * dt;
+            p.vx -= (dx / dist) * force;
+            p.vy -= (dy / dist) * force;
+          } else if (dist < attractRadius * 1.7) {
+            const pull = ((attractRadius * 1.7 - dist) / (attractRadius * 1.7)) * 0.004 * dt;
+            p.vx += (dx / dist) * pull;
+            p.vy += (dy / dist) * pull;
+          }
+
+          p.vx += Math.cos(timestamp * 0.001 + p.phase) * 0.004 * p.drift * dt;
+          p.vy += Math.sin(timestamp * 0.0011 + p.phase) * 0.004 * p.drift * dt;
+          p.vx *= 0.965;
+          p.vy *= 0.965;
+
+          p.x += p.vx * dt;
+          p.y += p.vy * dt;
+
+          if (p.x < -20) p.x = width + 20;
+          if (p.x > width + 20) p.x = -20;
+          if (p.y < -20) p.y = height + 20;
+          if (p.y > height + 20) p.y = -20;
+
+          const [r, g, b] = p.color;
+          ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${p.alpha})`;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      pointerAnimRef.current = requestAnimationFrame(animate);
+    };
+
+    configureCanvas();
+    initializeParticles();
+    frameClockRef.current = performance.now();
+    pointerAnimRef.current = requestAnimationFrame(animate);
+
+    window.addEventListener("resize", configureCanvas);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerdown", onMove);
+    window.addEventListener("pointerdown", onBurst);
+    window.addEventListener("pointerleave", onLeave);
+    if (prefersReducedMotion.addEventListener) {
+      prefersReducedMotion.addEventListener("change", onReduceMotion);
+    } else {
+      prefersReducedMotion.addListener(onReduceMotion);
+    }
+
+    return () => {
+      window.removeEventListener("resize", configureCanvas);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerdown", onMove);
+      window.removeEventListener("pointerdown", onBurst);
+      window.removeEventListener("pointerleave", onLeave);
+      if (prefersReducedMotion.removeEventListener) {
+        prefersReducedMotion.removeEventListener("change", onReduceMotion);
+      } else {
+        prefersReducedMotion.removeListener(onReduceMotion);
+      }
+      if (pointerAnimRef.current) {
+        cancelAnimationFrame(pointerAnimRef.current);
+      }
+    };
+  }, [theme]);
 
   // ---------- Keystroke Capture ----------
   useEffect(() => {
@@ -480,7 +698,7 @@ function App() {
         }
       );
 
-      showToast("Human session stored successfully! ✅", "success");
+      showToast("Human session stored successfully!", "success");
     } catch (error) {
       console.error("Collect error:", error);
       showToast("Failed to store session. Is the backend running?", "error");
@@ -558,22 +776,33 @@ function App() {
       })()
     : null;
 
+  const isLightTheme = theme === "light";
+  const toggleTheme = () => {
+    setTheme((prev) => (prev === "dark" ? "light" : "dark"));
+  };
+
   return (
-    <div className="min-h-screen bg-[#0a0a0f] text-white flex flex-col items-center justify-center p-4 sm:p-6 relative overflow-hidden">
-      <div className="absolute inset-0 bg-[radial-gradient(ellipse_80%_50%_at_50%_-20%,rgba(34,211,238,0.15),transparent)]" />
-      <div className="absolute inset-0 bg-[radial-gradient(ellipse_60%_40%_at_80%_100%,rgba(167,139,250,0.12),transparent)]" />
-      <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-cyan-500/10 rounded-full blur-3xl animate-float" />
-      <div className="absolute bottom-1/4 right-1/4 w-80 h-80 bg-violet-500/10 rounded-full blur-3xl animate-float" style={{ animationDelay: "-3s" }} />
+    <div ref={sceneRef} className="app-shell antigravity-scene min-h-screen flex flex-col items-center justify-center p-4 sm:p-6 relative overflow-hidden">
+      <canvas ref={particleCanvasRef} className="particle-canvas" aria-hidden="true" />
+      <div className="absolute inset-0 app-mesh-bg" />
+      <button
+        type="button"
+        onClick={toggleTheme}
+        className="theme-toggle z-20"
+        aria-label={`Switch to ${isLightTheme ? "dark" : "light"} mode`}
+      >
+        <span className="font-medium">{isLightTheme ? "Dark mode" : "Light mode"}</span>
+      </button>
 
       {/* Liveness overlay */}
       {livenessActive && (
         <div className="fixed inset-0 z-40 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xl animate-fade-in">
-          <div className="bg-[#16161f]/95 backdrop-blur-2xl border border-white/10 rounded-3xl p-8 sm:p-10 max-w-md w-full text-center animate-fade-in-scale shadow-2xl">
+          <div className="liveness-modal backdrop-blur-2xl border border-white/10 rounded-3xl p-8 sm:p-10 max-w-md w-full text-center animate-fade-in-scale shadow-2xl">
             <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-cyan-500/15 border border-cyan-500/30 mb-6 animate-liveness-pulse">
-              <span className="text-2xl">{livenessChallengeType === "blink" ? "👁" : "✋"}</span>
+              <span className="text-sm font-semibold">{livenessChallengeType === "blink" ? "BLINK" : "HAND"}</span>
             </div>
             <h3 className="font-display text-2xl font-bold text-white mb-1">Liveness check</h3>
-            <p className="text-white/60 text-sm mb-6">Prove you are live — not a photo or screen</p>
+            <p className="text-white/60 text-sm mb-6">Prove you are live - not a photo or screen</p>
             {livenessChallengeType === "fingers" && (
               <div className="text-7xl font-extrabold bg-gradient-to-r from-cyan-400 via-violet-400 to-fuchsia-400 bg-clip-text text-transparent my-6">
                 {livenessRequired}
@@ -593,7 +822,7 @@ function App() {
                 <div className="text-2xl font-bold text-white">{livenessCount} / {livenessRequired}</div>
                 <div className="text-sm text-white/50 mt-1">Blinks detected</div>
                 {livenessCount < livenessRequired && (
-                  <p className="mt-3 text-xs text-white/40">Blink naturally — close then open your eyes</p>
+                  <p className="mt-3 text-xs text-white/40">Blink naturally - close then open your eyes</p>
                 )}
               </div>
             )}
@@ -620,7 +849,7 @@ function App() {
             <button
               type="button"
               onClick={cancelLiveness}
-              className="px-5 py-2.5 rounded-xl border border-white/20 text-white/70 hover:bg-white/10 hover:text-white transition-all duration-200"
+              className="cancel-button px-5 py-2.5 rounded-xl border border-white/20 text-white/70 transition-all duration-200"
             >
               Cancel
             </button>
@@ -634,12 +863,12 @@ function App() {
             toast.type === "success" ? "bg-emerald-500/90 border-emerald-400/50 text-white" : "bg-red-500/90 border-red-400/50 text-white"
           }`}
         >
-          <span className="text-lg">{toast.type === "success" ? "✓" : "✗"}</span>
+          <span className="text-lg">{toast.type === "success" ? "OK" : "ERR"}</span>
           <span className="font-medium">{toast.message}</span>
         </div>
       )}
 
-      <div className="relative w-full max-w-2xl bg-[#16161f]/80 backdrop-blur-2xl rounded-3xl p-6 sm:p-10 border border-white/[0.06] shadow-2xl animate-fade-in">
+      <div ref={cardRef} className="main-panel reactive-card relative w-full max-w-2xl backdrop-blur-2xl rounded-3xl p-6 sm:p-10 border shadow-2xl animate-fade-in transition-transform duration-300 ease-out will-change-transform">
         <div className="text-center mb-8">
           <h1 className="font-display text-4xl sm:text-5xl lg:text-6xl font-extrabold mb-3 bg-gradient-to-r from-cyan-400 via-violet-400 to-fuchsia-400 bg-clip-text text-transparent tracking-tight">
             LUMA-X
@@ -657,7 +886,7 @@ function App() {
               className="relative rounded-2xl border border-white/10 w-full max-w-xs aspect-video object-cover shadow-2xl"
             />
             {cameraOn && (
-              <div className="absolute top-3 right-3 flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/60 backdrop-blur-sm border border-white/10">
+              <div className="status-pill absolute top-3 right-3 flex items-center gap-2 px-3 py-1.5 rounded-full backdrop-blur-sm border border-white/10">
                 <div className={`w-2.5 h-2.5 rounded-full ${faceDetected ? "bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.6)] animate-pulse" : "bg-red-400"}`} />
                 <span className="text-xs font-medium text-white/90">{faceDetected ? "Face detected" : "No face"}</span>
               </div>
@@ -683,7 +912,7 @@ function App() {
         </div>
 
         {typingStats && (
-          <div className="mb-5 p-4 rounded-2xl bg-white/[0.03] border border-white/[0.06] animate-fade-in">
+          <div className="stats-panel mb-5 p-4 rounded-2xl border animate-fade-in">
             <div className="grid grid-cols-3 gap-4 text-center">
               <div>
                 <div className="text-xs text-white/40 font-medium uppercase tracking-wider">Keystrokes</div>
@@ -702,7 +931,7 @@ function App() {
         )}
 
         <textarea
-          className="w-full p-4 rounded-2xl bg-white/[0.04] border border-white/10 placeholder:text-white/30 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 focus:border-cyan-500/30 transition-all duration-200 resize-none text-white"
+          className="typing-input w-full p-4 rounded-2xl border placeholder:text-white/30 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 focus:border-cyan-500/30 transition-all duration-200 resize-none text-white"
           rows="4"
           placeholder="Type here to capture keystroke patterns..."
           value={content}
@@ -759,14 +988,14 @@ function App() {
           <button
             type="button"
             onClick={resetForm}
-            className="w-full py-3 rounded-2xl font-medium border border-white/15 text-white/50 hover:bg-white/5 hover:text-white/70 transition-all duration-200"
+            className="neutral-button w-full py-3 rounded-2xl font-medium border text-white/50 transition-all duration-200"
           >
             Refresh
           </button>
         </div>
 
         {result && (
-          <div className="mt-8 p-6 rounded-2xl bg-white/[0.04] border border-white/10 animate-result-success shadow-xl" style={{ boxShadow: "0 0 0 1px rgba(255,255,255,0.05) inset" }}>
+          <div className="result-panel mt-8 p-6 rounded-2xl border animate-result-success shadow-xl">
             {typeof result.human_probability === "number" && (
               <div className="mb-5">
                 <div className="flex justify-between items-center mb-2">
@@ -796,7 +1025,7 @@ function App() {
             {result.hash && (
               <div className="pt-4 border-t border-white/10">
                 <div className="text-xs text-white/40 uppercase tracking-wider mb-1">Verification hash</div>
-                <div className="text-xs font-mono break-all text-white/50 bg-black/30 p-3 rounded-xl">
+                <div className="hash-box text-xs font-mono break-all text-white/50 p-3 rounded-xl">
                   {result.hash}
                 </div>
               </div>
@@ -809,3 +1038,4 @@ function App() {
 }
 
 export default App;
+
