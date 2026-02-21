@@ -26,7 +26,7 @@ y = []
 
 for entry in dataset:
     X.append(entry["session_vector"])
-    y.append(entry["label"])   # ✅ USE STORED LABEL
+    y.append(entry["label"])   # USE STORED LABEL
 
 X = np.array(X)
 y = np.array(y)

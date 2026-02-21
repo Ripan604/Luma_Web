@@ -25,12 +25,12 @@ const BLINK_COOLDOWN_MS = 350;  // Min ms between blinks
 const EAR_SMOOTH_SAMPLES = 7;   // Running average for stability
 const FINGER_SMOOTH_SAMPLES = 7; // Majority vote window for finger count
 const FINGER_STABLE_MS = 550;   // Must hold correct count this long
-const IDENTITY_SIMILARITY_MIN = 0.94;
-const IDENTITY_CENTER_SHIFT_MAX = 0.17;
-const IDENTITY_AREA_RATIO_MIN = 0.58;
-const IDENTITY_AREA_RATIO_MAX = 1.72;
-const IDENTITY_MISMATCH_MAX = 6;
-const IDENTITY_MISSING_MAX = 8;
+const IDENTITY_SIMILARITY_MIN = 0.9;
+const IDENTITY_CENTER_SHIFT_MAX = 0.24;
+const IDENTITY_AREA_RATIO_MIN = 0.45;
+const IDENTITY_AREA_RATIO_MAX = 2.2;
+const IDENTITY_MISMATCH_MAX = 12;
+const IDENTITY_MISSING_MAX = 15;
 const FACE_SIGNATURE_POINTS = [33, 263, 1, 61, 291, 4, 10, 152, 70, 300, 234, 454];
 const TYPING_IDENTITY_SIMILARITY_MIN = 0.92;
 const TYPING_CENTER_SHIFT_MAX = 0.24;
@@ -281,7 +281,6 @@ function App() {
     return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
   });
   const sceneRef = useRef(null);
-  const cardRef = useRef(null);
   const particleCanvasRef = useRef(null);
   const particleCtxRef = useRef(null);
   const particlesRef = useRef([]);
@@ -758,14 +757,6 @@ function App() {
       current.y += (target.y - current.y) * 0.12;
       current.active = target.active;
 
-      const normX = ((current.x / width) - 0.5) * 2;
-      const normY = ((current.y / height) - 0.5) * 2;
-
-      if (cardRef.current) {
-        cardRef.current.style.setProperty("--tilt-x", `${(-normY * 4.5).toFixed(2)}`);
-        cardRef.current.style.setProperty("--tilt-y", `${(normX * 6.5).toFixed(2)}`);
-      }
-
       const ctx = particleCtxRef.current;
       if (ctx) {
         ctx.clearRect(0, 0, width, height);
@@ -951,7 +942,7 @@ function App() {
       return false;
     }
 
-    const identityAnchor = typingIdentityRef.current;
+    const identityAnchor = latestFaceIdentityRef.current || typingIdentityRef.current;
     if (!identityAnchor) {
       showToast("Typing-linked face lock not ready. Type with one visible face first.", "error");
       return false;
@@ -1180,75 +1171,57 @@ function App() {
   };
 
   return (
-    <div ref={sceneRef} className="app-shell antigravity-scene min-h-screen flex flex-col items-center justify-center p-4 sm:p-6 relative overflow-hidden">
+    <div ref={sceneRef} className="experience-shell antigravity-scene min-h-screen relative overflow-hidden">
       <canvas ref={particleCanvasRef} className="particle-canvas" aria-hidden="true" />
-      <div className="absolute inset-0 app-mesh-bg" />
-      <button
-        type="button"
-        onClick={toggleTheme}
-        className="theme-toggle z-20"
-        aria-label={`Switch to ${isLightTheme ? "dark" : "light"} mode`}
-      >
-        <span className="font-medium">{isLightTheme ? "Dark mode" : "Light mode"}</span>
-      </button>
+      <div className="backdrop-layer app-mesh-bg" />
+      <div className="grain-layer" />
 
       {/* Liveness overlay */}
       {livenessActive && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xl animate-fade-in">
-          <div className="liveness-modal backdrop-blur-2xl border border-white/10 rounded-3xl p-8 sm:p-10 max-w-md w-full text-center animate-fade-in-scale shadow-2xl">
-            <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-cyan-500/15 border border-cyan-500/30 mb-6 animate-liveness-pulse">
-              <span className="text-sm font-semibold">{livenessChallengeType === "blink" ? "BLINK" : "HAND"}</span>
+        <div className="overlay-backdrop fixed inset-0 z-40 flex items-center justify-center p-4 animate-fade-in">
+          <div className="liveness-modal rounded-3xl p-8 sm:p-10 max-w-md w-full animate-fade-in-scale shadow-2xl">
+            <div className="challenge-badge animate-liveness-pulse">
+              <span>{livenessChallengeType === "blink" ? "BLINK" : "HAND"}</span>
             </div>
-            <h3 className="font-display text-2xl font-bold text-white mb-1">Liveness check</h3>
-            <p className="text-white/60 text-sm mb-6">Prove you are live - not a photo or screen</p>
+            <h3 className="modal-title">Identity Liveness Check</h3>
+            <p className="modal-copy">Complete this as the same person who typed in the box.</p>
             {livenessChallengeType === "fingers" && (
-              <div className="text-7xl font-extrabold bg-gradient-to-r from-cyan-400 via-violet-400 to-fuchsia-400 bg-clip-text text-transparent my-6">
-                {livenessRequired}
-              </div>
+              <div className="challenge-number">{livenessRequired}</div>
             )}
-            <p className="text-cyan-400 font-semibold mb-6">{livenessPrompt}</p>
+            <p className="challenge-prompt">{livenessPrompt}</p>
             {livenessChallengeType === "blink" && (
-              <div className="mb-6">
-                <div className="flex items-center justify-center gap-2 mb-2">
+              <div className="challenge-block">
+                <div className="challenge-dots">
                   {Array.from({ length: livenessRequired }).map((_, i) => (
-                    <div
+                    <span
                       key={i}
-                      className={`w-3 h-3 rounded-full transition-all duration-300 ${i < livenessCount ? "bg-cyan-400 scale-110 shadow-[0_0_20px_rgba(34,211,238,0.5)]" : "bg-white/20"}`}
+                      className={`challenge-dot ${i < livenessCount ? "challenge-dot-active" : ""}`}
                     />
                   ))}
                 </div>
-                <div className="text-2xl font-bold text-white">{livenessCount} / {livenessRequired}</div>
-                <div className="text-sm text-white/50 mt-1">Blinks detected</div>
+                <div className="challenge-value">{livenessCount} / {livenessRequired}</div>
+                <p className="challenge-meta">Blinks detected</p>
                 {livenessCount < livenessRequired && (
-                  <p className="mt-3 text-xs text-white/40">Blink naturally - close then open your eyes</p>
+                  <p className="challenge-hint">Blink naturally: close then open your eyes.</p>
                 )}
               </div>
             )}
             {livenessChallengeType === "fingers" && (
-              <div className="mb-6">
-                <div className="flex items-center justify-center gap-2 mb-2">
+              <div className="challenge-block">
+                <div className="finger-bars">
                   {Array.from({ length: 5 }).map((_, i) => (
-                    <div
-                      key={i}
-                      className={`w-2 h-8 rounded-full transition-all duration-300 ${i < fingersShown ? "bg-amber-400/90" : "bg-white/15"}`}
-                    />
+                    <span key={i} className={`finger-bar ${i < fingersShown ? "finger-bar-active" : ""}`} />
                   ))}
                 </div>
-                <div className="text-2xl font-bold text-white">{fingersShown} / {livenessRequired}</div>
-                <div className="text-sm text-white/50 mt-1">Fingers shown</div>
-                {fingersShown === livenessRequired && (
-                  <p className="mt-3 text-xs text-emerald-400 animate-pulse">Hold steady...</p>
-                )}
+                <div className="challenge-value">{fingersShown} / {livenessRequired}</div>
+                <p className="challenge-meta">Fingers shown</p>
+                {fingersShown === livenessRequired && <p className="challenge-hint success">Hold steady...</p>}
                 {fingersShown !== livenessRequired && fingersShown > 0 && (
-                  <p className="mt-3 text-xs text-amber-400/90">Adjust to show {livenessRequired} finger{livenessRequired === 1 ? "" : "s"}</p>
+                  <p className="challenge-hint">Adjust to show {livenessRequired} finger{livenessRequired === 1 ? "" : "s"}.</p>
                 )}
               </div>
             )}
-            <button
-              type="button"
-              onClick={cancelLiveness}
-              className="cancel-button px-5 py-2.5 rounded-xl border border-white/20 text-white/70 transition-all duration-200"
-            >
+            <button type="button" onClick={cancelLiveness} className="cancel-button">
               Cancel
             </button>
           </div>
@@ -1256,193 +1229,201 @@ function App() {
       )}
 
       {toast.show && (
-        <div
-          className={`fixed top-6 right-6 z-50 px-5 py-3 rounded-2xl shadow-2xl backdrop-blur-xl border animate-slide-in flex items-center gap-3 ${
-            toast.type === "success" ? "bg-emerald-500/90 border-emerald-400/50 text-white" : "bg-red-500/90 border-red-400/50 text-white"
-          }`}
-        >
-          <span className="text-lg">{toast.type === "success" ? "OK" : "ERR"}</span>
-          <span className="font-medium">{toast.message}</span>
+        <div className={`toast-chip animate-slide-in ${toast.type === "success" ? "toast-success" : "toast-error"}`}>
+          <span className="toast-symbol">{toast.type === "success" ? "OK" : "ERR"}</span>
+          <span className="toast-message">{toast.message}</span>
         </div>
       )}
 
-      <div ref={cardRef} className="main-panel reactive-card relative w-full max-w-2xl backdrop-blur-2xl rounded-3xl p-6 sm:p-10 border shadow-2xl animate-fade-in transition-transform duration-300 ease-out will-change-transform">
-        <div className="text-center mb-8">
-          <h1 className="font-display text-4xl sm:text-5xl lg:text-6xl font-extrabold mb-3 bg-gradient-to-r from-cyan-400 via-violet-400 to-fuchsia-400 bg-clip-text text-transparent tracking-tight">
-            LUMA-X
-          </h1>
-          <p className="text-white/50 text-sm sm:text-base">Multi-Modal Human Presence Attestation</p>
-        </div>
-
-        <div className="mb-6 flex flex-col items-center">
-          <div className="relative group">
-            <div className={`absolute -inset-1 rounded-2xl transition-all duration-500 ${faceDetected ? "bg-cyan-500/20 blur-sm" : "bg-white/5"}`} />
-            <video
-              ref={videoRef}
-              autoPlay
-              playsInline
-              className="relative rounded-2xl border border-white/10 w-full max-w-xs aspect-video object-cover shadow-2xl"
-            />
-            {cameraOn && (
-              <div className="status-pill absolute top-3 right-3 flex items-center gap-2 px-3 py-1.5 rounded-full backdrop-blur-sm border border-white/10">
-                <div
-                  className={`w-2.5 h-2.5 rounded-full ${
-                    multiFaceDetected
-                      ? "bg-amber-400 shadow-[0_0_12px_rgba(251,191,36,0.6)]"
-                      : faceDetected
-                        ? "bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.6)] animate-pulse"
-                        : "bg-red-400"
-                  }`}
-                />
-                <span className="text-xs font-medium text-white/90">
-                  {multiFaceDetected ? "Multiple faces" : faceDetected ? "Face detected" : "No face"}
-                </span>
-              </div>
-            )}
-          </div>
-          <div className="flex gap-3 mt-5">
-            {!cameraOn ? (
-              <button
-                onClick={startCamera}
-                className="px-6 py-3 rounded-xl font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/40 hover:bg-emerald-500/30 hover:scale-[1.02] hover:-translate-y-0.5 active:scale-[0.98] transition-all duration-200"
-              >
-                Start camera
-              </button>
-            ) : (
-              <button
-                onClick={stopCamera}
-                className="px-6 py-3 rounded-xl font-semibold bg-red-500/20 text-red-400 border border-red-500/40 hover:bg-red-500/30 hover:scale-[1.02] hover:-translate-y-0.5 active:scale-[0.98] transition-all duration-200"
-              >
-                Stop camera
-              </button>
-            )}
-          </div>
-          {multiFaceDetected && (
-            <p className="mt-3 text-xs text-amber-400">Only one face is allowed for verification.</p>
-          )}
-        </div>
-
-        {typingStats && (
-          <div className="stats-panel mb-5 p-4 rounded-2xl border animate-fade-in">
-            <div className="grid grid-cols-3 gap-4 text-center">
-              <div>
-                <div className="text-xs text-white/40 font-medium uppercase tracking-wider">Keystrokes</div>
-                <div className="text-xl font-bold text-cyan-400">{keystrokes.length}</div>
-              </div>
-              <div>
-                <div className="text-xs text-white/40 font-medium uppercase tracking-wider">Mean</div>
-                <div className="text-xl font-bold text-violet-400">{typingStats.mean}s</div>
-              </div>
-              <div>
-                <div className="text-xs text-white/40 font-medium uppercase tracking-wider">Std</div>
-                <div className="text-xl font-bold text-fuchsia-400">{typingStats.std}s</div>
-              </div>
+      <div className="content-shell">
+        <header className="topbar animate-fade-in">
+          <div className="brand-cluster">
+            <div className="brand-mark">LX</div>
+            <div>
+              <p className="brand-caption">Realtime Human Verification Platform</p>
+              <h1 className="brand-title">LUMA-X</h1>
             </div>
           </div>
-        )}
-
-        <textarea
-          className="typing-input w-full p-4 rounded-2xl border placeholder:text-white/30 focus:outline-none focus:ring-2 focus:ring-cyan-500/50 focus:border-cyan-500/30 transition-all duration-200 resize-none text-white"
-          rows="4"
-          placeholder="Type here to capture keystroke patterns..."
-          value={content}
-          onChange={(e) => setContent(e.target.value)}
-        />
-        {keystrokes.length === 0 && <p className="mt-2 text-xs text-white/30 text-center">Start typing to capture data</p>}
-
-        <div className="mt-6 space-y-3">
-          <button
-            onClick={handleVerify}
-            disabled={loading.verify || !faceDetected || multiFaceDetected || keystrokes.length < 2}
-            className="w-full py-4 rounded-2xl font-semibold flex items-center justify-center gap-3 bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/25 hover:shadow-[0_0_30px_-5px_rgba(34,211,238,0.4)] hover:scale-[1.02] hover:-translate-y-0.5 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:translate-y-0 transition-all duration-200"
-          >
-            {loading.verify ? (
-              <>
-                <div className="w-5 h-5 border-2 border-cyan-400 border-t-transparent rounded-full animate-spin" />
-                Verifying...
-              </>
-            ) : (
-              <>
-                <span>Verify human presence</span>
-                <span className="text-xs opacity-60">Ctrl+Enter</span>
-              </>
-            )}
-          </button>
-          <button
-            onClick={handleCollect}
-            disabled={loading.collect || !faceDetected || multiFaceDetected || keystrokes.length < 2}
-            className="w-full py-4 rounded-2xl font-semibold flex items-center justify-center gap-3 bg-violet-500/15 text-violet-400 border border-violet-500/30 hover:bg-violet-500/25 hover:shadow-[0_0_30px_-5px_rgba(167,139,250,0.4)] hover:scale-[1.02] hover:-translate-y-0.5 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:translate-y-0 transition-all duration-200"
-          >
-            {loading.collect ? (
-              <>
-                <div className="w-5 h-5 border-2 border-violet-400 border-t-transparent rounded-full animate-spin" />
-                Collecting...
-              </>
-            ) : (
-              <>
-                <span>Collect human sample</span>
-                <span className="text-xs opacity-60">Ctrl+S</span>
-              </>
-            )}
-          </button>
-          <button
-            onClick={handleDemoBot}
-            disabled={loading.demo}
-            className="w-full py-4 rounded-2xl font-semibold flex items-center justify-center gap-3 bg-amber-500/15 text-amber-400 border border-amber-500/30 hover:bg-amber-500/25 hover:scale-[1.02] hover:-translate-y-0.5 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:translate-y-0 transition-all duration-200"
-          >
-            {loading.demo ? (
-              <div className="w-5 h-5 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
-            ) : (
-              "Demo: show bot result"
-            )}
-          </button>
           <button
             type="button"
-            onClick={resetForm}
-            className="neutral-button w-full py-3 rounded-2xl font-medium border text-white/50 transition-all duration-200"
+            onClick={toggleTheme}
+            className="theme-toggle"
+            aria-label={`Switch to ${isLightTheme ? "dark" : "light"} mode`}
           >
-            Refresh
+            {isLightTheme ? "Switch to dark" : "Switch to light"}
           </button>
-        </div>
+        </header>
 
-        {result && (
-          <div className="result-panel mt-8 p-6 rounded-2xl border animate-result-success shadow-xl">
-            {typeof result.human_probability === "number" && (
-              <div className="mb-5">
-                <div className="flex justify-between items-center mb-2">
-                  <span className="text-sm text-white/50 font-medium">Human probability</span>
-                  <span className="text-2xl font-bold text-cyan-400">
-                    {(result.human_probability * 100).toFixed(1)}%
+        <main className="dashboard-grid">
+          <section className="main-panel capture-panel animate-fade-in">
+            <div className="section-head">
+              <h2>Live Capture</h2>
+              <p>Single-subject feed with anti-handoff identity continuity.</p>
+            </div>
+
+            <div className="camera-shell">
+              <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                className="video-frame"
+              />
+              {cameraOn && (
+                <div className="status-pill">
+                  <span
+                    className={`status-dot ${
+                      multiFaceDetected
+                        ? "status-alert"
+                        : faceDetected
+                          ? "status-ok"
+                          : "status-off"
+                    }`}
+                  />
+                  <span className="status-label">
+                    {multiFaceDetected ? "Multiple faces" : faceDetected ? "Face detected" : "No face"}
                   </span>
                 </div>
-                <div className="w-full h-2 bg-white/10 rounded-full overflow-hidden">
-                  <div
-                    className={`h-full rounded-full transition-all duration-700 ease-out ${
-                      result.prediction === 1
-                        ? "bg-gradient-to-r from-emerald-500 to-emerald-400"
-                        : "bg-gradient-to-r from-red-500 to-red-400"
-                    }`}
-                    style={{ width: `${result.human_probability * 100}%` }}
-                  />
-                </div>
-              </div>
-            )}
-            <div className="text-center py-4">
-              <div className="text-xs text-white/40 uppercase tracking-widest mb-2">Prediction</div>
-              <div className={`text-2xl font-bold ${result.prediction === 1 ? "text-emerald-400" : "text-red-400"}`}>
-                {result.prediction === 1 ? "Human verified" : "Bot detected"}
-              </div>
+              )}
             </div>
-            {result.hash && (
-              <div className="pt-4 border-t border-white/10">
-                <div className="text-xs text-white/40 uppercase tracking-wider mb-1">Verification hash</div>
-                <div className="hash-box text-xs font-mono break-all text-white/50 p-3 rounded-xl">
-                  {result.hash}
+
+            <div className="camera-actions">
+              {!cameraOn ? (
+                <button onClick={startCamera} className="pill-btn pill-start">
+                  Start camera
+                </button>
+              ) : (
+                <button onClick={stopCamera} className="pill-btn pill-stop">
+                  Stop camera
+                </button>
+              )}
+            </div>
+
+            {multiFaceDetected && (
+              <p className="hint-warning">Only one face is allowed for verification.</p>
+            )}
+
+            {typingStats && (
+              <div className="stats-strip animate-fade-in">
+                <div className="stat-card">
+                  <p className="stat-label">Keystrokes</p>
+                  <p className="stat-value">{keystrokes.length}</p>
+                </div>
+                <div className="stat-card">
+                  <p className="stat-label">Mean Delay</p>
+                  <p className="stat-value">{typingStats.mean}s</p>
+                </div>
+                <div className="stat-card">
+                  <p className="stat-label">Std Dev</p>
+                  <p className="stat-value">{typingStats.std}s</p>
                 </div>
               </div>
             )}
-          </div>
-        )}
+          </section>
+
+          <section className="main-panel flow-panel animate-fade-in">
+            <div className="section-head">
+              <h2>Verification Flow</h2>
+              <p>Type naturally, then complete liveness in one uninterrupted sequence.</p>
+            </div>
+
+            <label htmlFor="typing-input" className="field-label">Behavior Sample</label>
+            <textarea
+              id="typing-input"
+              className="typing-input"
+              rows="5"
+              placeholder="Type a natural paragraph here to capture timing patterns..."
+              value={content}
+              onChange={(e) => setContent(e.target.value)}
+            />
+            {keystrokes.length === 0 && <p className="field-hint">Start typing to capture keystroke dynamics.</p>}
+
+            <div className="actions-stack">
+              <button
+                onClick={handleVerify}
+                disabled={loading.verify || !faceDetected || multiFaceDetected || keystrokes.length < 2}
+                className="cta cta-primary"
+              >
+                {loading.verify ? (
+                  <>
+                    <span className="inline-spinner" />
+                    Verifying...
+                  </>
+                ) : (
+                  <>
+                    <span>Verify human presence</span>
+                    <span className="shortcut-chip">Ctrl+Enter</span>
+                  </>
+                )}
+              </button>
+
+              <button
+                onClick={handleCollect}
+                disabled={loading.collect || !faceDetected || multiFaceDetected || keystrokes.length < 2}
+                className="cta cta-secondary"
+              >
+                {loading.collect ? (
+                  <>
+                    <span className="inline-spinner" />
+                    Collecting...
+                  </>
+                ) : (
+                  <>
+                    <span>Collect human sample</span>
+                    <span className="shortcut-chip">Ctrl+S</span>
+                  </>
+                )}
+              </button>
+
+              <button onClick={handleDemoBot} disabled={loading.demo} className="cta cta-tertiary">
+                {loading.demo ? (
+                  <>
+                    <span className="inline-spinner" />
+                    Running demo...
+                  </>
+                ) : (
+                  "Demo: show bot result"
+                )}
+              </button>
+
+              <button type="button" onClick={resetForm} className="cta cta-ghost">
+                Refresh session
+              </button>
+            </div>
+
+            {result && (
+              <div className="result-panel animate-result-success">
+                {typeof result.human_probability === "number" && (
+                  <div className="probability-block">
+                    <div className="probability-header">
+                      <span>Human probability</span>
+                      <strong>{(result.human_probability * 100).toFixed(1)}%</strong>
+                    </div>
+                    <div className="probability-track">
+                      <div
+                        className={`probability-fill ${result.prediction === 1 ? "probability-human" : "probability-bot"}`}
+                        style={{ width: `${result.human_probability * 100}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div className="prediction-block">
+                  <p className="prediction-label">Prediction</p>
+                  <p className={`prediction-value ${result.prediction === 1 ? "prediction-human" : "prediction-bot"}`}>
+                    {result.prediction === 1 ? "Human verified" : "Bot detected"}
+                  </p>
+                </div>
+
+                {result.hash && (
+                  <div className="hash-section">
+                    <p className="hash-label">Verification hash</p>
+                    <div className="hash-box">{result.hash}</div>
+                  </div>
+                )}
+              </div>
+            )}
+          </section>
+        </main>
       </div>
     </div>
   );

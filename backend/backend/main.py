@@ -73,6 +73,11 @@ class SessionData(BaseModel):
     content: str
     label: int | None = None  # Only used for collect
 
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 # ===============================
 # VERIFY ENDPOINT
 # ===============================
