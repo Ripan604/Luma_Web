@@ -25,6 +25,13 @@ const BLINK_COOLDOWN_MS = 350;  // Min ms between blinks
 const EAR_SMOOTH_SAMPLES = 7;   // Running average for stability
 const FINGER_SMOOTH_SAMPLES = 5; // Majority vote for finger count
 const FINGER_STABLE_MS = 500;   // Must hold correct count this long
+const IDENTITY_SIMILARITY_MIN = 0.94;
+const IDENTITY_CENTER_SHIFT_MAX = 0.17;
+const IDENTITY_AREA_RATIO_MIN = 0.58;
+const IDENTITY_AREA_RATIO_MAX = 1.72;
+const IDENTITY_MISMATCH_MAX = 6;
+const IDENTITY_MISSING_MAX = 8;
+const FACE_SIGNATURE_POINTS = [33, 263, 1, 61, 291, 4, 10, 152, 70, 300, 234, 454];
 
 // Count extended fingers from MediaPipe Hands (21 landmarks). Robust algorithm.
 function countExtendedFingers(landmarks) {
@@ -74,15 +81,72 @@ function smoothFingerCount(history, required) {
   return best === required ? best : null;
 }
 
+function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length || a.length === 0) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom > 0 ? dot / denom : 0;
+}
+
+function buildFaceIdentitySnapshot(landmarks) {
+  if (!landmarks || landmarks.length < 468) return null;
+  const dist = (a, b) =>
+    Math.hypot(landmarks[a].x - landmarks[b].x, landmarks[a].y - landmarks[b].y);
+  const eyeDist = dist(33, 263) || 0.0001;
+  const nose = landmarks[1];
+
+  const descriptor = [];
+  for (let i = 0; i < FACE_SIGNATURE_POINTS.length; i++) {
+    const idx = FACE_SIGNATURE_POINTS[i];
+    descriptor.push((landmarks[idx].x - nose.x) / eyeDist);
+    descriptor.push((landmarks[idx].y - nose.y) / eyeDist);
+  }
+  descriptor.push(dist(61, 291) / eyeDist);
+  descriptor.push(dist(10, 152) / eyeDist);
+  descriptor.push(dist(70, 300) / eyeDist);
+
+  let minX = 1;
+  let minY = 1;
+  let maxX = 0;
+  let maxY = 0;
+  for (let i = 0; i < landmarks.length; i++) {
+    const p = landmarks[i];
+    if (p.x < minX) minX = p.x;
+    if (p.y < minY) minY = p.y;
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+
+  return {
+    descriptor,
+    center: {
+      x: (minX + maxX) / 2,
+      y: (minY + maxY) / 2,
+    },
+    area: Math.max((maxX - minX) * (maxY - minY), 0.00001),
+  };
+}
+
 function App() {
   const [content, setContent] = useState("");
   const [keystrokes, setKeystrokes] = useState([]);
   const [cameraOn, setCameraOn] = useState(false);
   const [result, setResult] = useState(null);
-  const [faceVector, setFaceVector] = useState([]);
   const [loading, setLoading] = useState({ verify: false, collect: false, demo: false });
   const [toast, setToast] = useState({ show: false, message: "", type: "success" });
   const [faceDetected, setFaceDetected] = useState(false);
+  const [multiFaceDetected, setMultiFaceDetected] = useState(false);
+  const faceVectorRef = useRef([]);
+  const latestFaceIdentityRef = useRef(null);
+  const faceDetectedRef = useRef(false);
+  const multiFaceDetectedRef = useRef(false);
   const [theme, setTheme] = useState(() => {
     if (typeof window === "undefined") return "dark";
     const saved = window.localStorage.getItem("luma-theme");
@@ -118,6 +182,9 @@ function App() {
     fingerCountHistory: [],
     fingerStableSince: null,
     earHistory: [],
+    identityRef: null,
+    mismatchFrames: 0,
+    missingFrames: 0,
   });
   const setLivenessCountRef = useRef(() => {});
 
@@ -127,6 +194,36 @@ function App() {
   const handsRef = useRef(null);
   const [fingersShown, setFingersShown] = useState(0);
   const setFingersShownRef = useRef(() => {});
+
+  const setFaceDetectedSafe = (next) => {
+    if (faceDetectedRef.current !== next) {
+      faceDetectedRef.current = next;
+      setFaceDetected(next);
+    }
+  };
+
+  const setMultiFaceDetectedSafe = (next) => {
+    if (multiFaceDetectedRef.current !== next) {
+      multiFaceDetectedRef.current = next;
+      setMultiFaceDetected(next);
+    }
+  };
+
+  const failLivenessIdentity = (message) => {
+    livenessRef.current.active = false;
+    livenessRef.current.challengeType = null;
+    livenessRef.current.onComplete = null;
+    livenessRef.current.identityRef = null;
+    livenessRef.current.mismatchFrames = 0;
+    livenessRef.current.missingFrames = 0;
+    livenessRef.current.fingerStableSince = null;
+    livenessRef.current.fingerCountHistory = [];
+    livenessRef.current.earHistory = [];
+    setLivenessActive(false);
+    setLivenessCount(0);
+    setFingersShown(0);
+    showToast(message, "error");
+  };
 
   // ---------- Start Camera ----------
   const startCamera = async () => {
@@ -142,7 +239,7 @@ function App() {
       });
 
       faceMesh.setOptions({
-        maxNumFaces: 1,
+        maxNumFaces: 2,
         refineLandmarks: true,
         minDetectionConfidence: 0.5,
         minTrackingConfidence: 0.5,
@@ -175,6 +272,9 @@ function App() {
             } else if (now - l.fingerStableSince >= FINGER_STABLE_MS) {
               l.active = false;
               l.challengeType = null;
+              l.identityRef = null;
+              l.mismatchFrames = 0;
+              l.missingFrames = 0;
               l.fingerStableSince = null;
               l.fingerCountHistory = [];
               const done = l.onComplete;
@@ -193,8 +293,25 @@ function App() {
       handsRef.current = hands;
 
       faceMesh.onResults((results) => {
-        if (results.multiFaceLandmarks?.length > 0) {
-          const landmarks = results.multiFaceLandmarks[0];
+        const faces = results.multiFaceLandmarks || [];
+        const faceCount = faces.length;
+
+        if (faceCount > 1) {
+          setMultiFaceDetectedSafe(true);
+          setFaceDetectedSafe(false);
+          faceVectorRef.current = [];
+          latestFaceIdentityRef.current = null;
+          const l = livenessRef.current;
+          if (l.active) {
+            failLivenessIdentity("Multiple faces detected. Only one face is allowed.");
+          }
+          return;
+        }
+
+        setMultiFaceDetectedSafe(false);
+
+        if (faceCount === 1) {
+          const landmarks = faces[0];
           let vector = [];
 
           // 50 landmarks x (x,y) = 100 features
@@ -203,11 +320,52 @@ function App() {
             vector.push(landmarks[i].y);
           }
 
-          setFaceVector(vector);
-          setFaceDetected(true);
+          faceVectorRef.current = vector;
+          const identitySnapshot = buildFaceIdentitySnapshot(landmarks);
+          if (identitySnapshot) {
+            latestFaceIdentityRef.current = identitySnapshot;
+          }
+          setFaceDetectedSafe(true);
+
+          const l = livenessRef.current;
+          if (l.active) {
+            l.missingFrames = 0;
+            if (!identitySnapshot || !l.identityRef) {
+              failLivenessIdentity("Face tracking lost. Please keep the same person centered.");
+              return;
+            }
+
+            const similarity = cosineSimilarity(l.identityRef.descriptor, identitySnapshot.descriptor);
+            const centerShift = Math.hypot(
+              l.identityRef.center.x - identitySnapshot.center.x,
+              l.identityRef.center.y - identitySnapshot.center.y
+            );
+            const areaRatio = identitySnapshot.area / (l.identityRef.area || identitySnapshot.area);
+            const identityStable =
+              similarity >= IDENTITY_SIMILARITY_MIN &&
+              centerShift <= IDENTITY_CENTER_SHIFT_MAX &&
+              areaRatio >= IDENTITY_AREA_RATIO_MIN &&
+              areaRatio <= IDENTITY_AREA_RATIO_MAX;
+
+            if (identityStable) {
+              l.mismatchFrames = Math.max(0, l.mismatchFrames - 1);
+              l.identityRef.center.x =
+                l.identityRef.center.x * 0.9 + identitySnapshot.center.x * 0.1;
+              l.identityRef.center.y =
+                l.identityRef.center.y * 0.9 + identitySnapshot.center.y * 0.1;
+              l.identityRef.area = l.identityRef.area * 0.9 + identitySnapshot.area * 0.1;
+            } else {
+              l.mismatchFrames += 1;
+              if (l.mismatchFrames >= IDENTITY_MISMATCH_MAX) {
+                failLivenessIdentity(
+                  "Identity mismatch detected. The same person must stay visible throughout liveness."
+                );
+                return;
+              }
+            }
+          }
 
           // Liveness: blink detection with smoothed EAR, both eyes must close
-          const l = livenessRef.current;
           if (l.active && l.challengeType === "blink" && l.required > 0) {
             try {
               const raw = getEAR(landmarks);
@@ -235,6 +393,9 @@ function App() {
                 if (l.count >= l.required) {
                   l.active = false;
                   l.challengeType = null;
+                  l.identityRef = null;
+                  l.mismatchFrames = 0;
+                  l.missingFrames = 0;
                   l.earHistory = [];
                   const done = l.onComplete;
                   l.onComplete = null;
@@ -246,7 +407,16 @@ function App() {
             }
           }
         } else {
-          setFaceDetected(false);
+          setFaceDetectedSafe(false);
+          faceVectorRef.current = [];
+          latestFaceIdentityRef.current = null;
+          const l = livenessRef.current;
+          if (l.active) {
+            l.missingFrames += 1;
+            if (l.missingFrames >= IDENTITY_MISSING_MAX) {
+              failLivenessIdentity("Face disappeared. Keep your face in frame during liveness.");
+            }
+          }
         }
       });
 
@@ -278,6 +448,10 @@ function App() {
     if (videoRef.current) {
       videoRef.current.srcObject = null;
     }
+    faceVectorRef.current = [];
+    latestFaceIdentityRef.current = null;
+    setFaceDetectedSafe(false);
+    setMultiFaceDetectedSafe(false);
     setCameraOn(false);
   };
 
@@ -291,6 +465,10 @@ function App() {
       if (videoRef.current) {
         videoRef.current.srcObject = null;
       }
+      faceVectorRef.current = [];
+      latestFaceIdentityRef.current = null;
+      faceDetectedRef.current = false;
+      multiFaceDetectedRef.current = false;
     };
   }, []);
 
@@ -530,6 +708,7 @@ function App() {
 
   // ---------- Build Session Vector ----------
   const buildSessionVector = () => {
+    const faceVector = faceVectorRef.current;
     let intervals = [];
 
     if (keystrokes.length > 1) {
@@ -588,6 +767,26 @@ function App() {
   };
 
   const startLiveness = (onComplete) => {
+    if (multiFaceDetectedRef.current) {
+      showToast("Multiple faces detected. Only one face should be visible.", "error");
+      return false;
+    }
+
+    const identityAnchor = latestFaceIdentityRef.current;
+    if (!identityAnchor) {
+      showToast("Face lock not ready. Keep your face centered and try again.", "error");
+      return false;
+    }
+
+    const identityRef = {
+      descriptor: [...identityAnchor.descriptor],
+      center: {
+        x: identityAnchor.center.x,
+        y: identityAnchor.center.y,
+      },
+      area: identityAnchor.area,
+    };
+
     const rand = Math.random();
     if (rand < 0.5) {
       // Blink challenge: 1-3 blinks (weighted toward 2)
@@ -595,7 +794,9 @@ function App() {
       const required = blinkOptions[Math.floor(Math.random() * blinkOptions.length)];
       setLivenessRequired(required);
       setLivenessCount(0);
-      setLivenessPrompt(`Blink ${required} time${required === 1 ? "" : "s"} to prove you're live (not a photo)`);
+      setLivenessPrompt(
+        `Blink ${required} time${required === 1 ? "" : "s"} and keep the same face in frame`
+      );
       setLivenessChallengeType("blink");
       setLivenessActive(true);
       livenessRef.current = {
@@ -609,6 +810,9 @@ function App() {
         fingerCountHistory: [],
         fingerStableSince: null,
         earHistory: [],
+        identityRef,
+        mismatchFrames: 0,
+        missingFrames: 0,
       };
     } else {
       // Finger challenge: 1-5 fingers (weighted toward 2-4)
@@ -617,7 +821,9 @@ function App() {
       setLivenessRequired(required);
       setFingersShown(0);
       setLivenessCount(0);
-      setLivenessPrompt(`Show ${required} finger${required === 1 ? "" : "s"} to the camera`);
+      setLivenessPrompt(
+        `Show ${required} finger${required === 1 ? "" : "s"} while keeping the same face visible`
+      );
       setLivenessChallengeType("fingers");
       setLivenessActive(true);
       livenessRef.current = {
@@ -631,12 +837,20 @@ function App() {
         fingerCountHistory: [],
         fingerStableSince: null,
         earHistory: [],
+        identityRef,
+        mismatchFrames: 0,
+        missingFrames: 0,
       };
     }
+    return true;
   };
 
   // ---------- Verify (starts liveness first) ----------
   const handleVerify = () => {
+    if (multiFaceDetected) {
+      showToast("Multiple faces detected. Only one face should be visible.", "error");
+      return;
+    }
     if (!cameraOn || !faceDetected) {
       showToast("Turn on the camera and ensure your face is detected first.", "error");
       return;
@@ -647,12 +861,13 @@ function App() {
     }
     if (buildSessionVector() == null) return;
 
-    startLiveness(() => {
+    const started = startLiveness(() => {
       setLivenessActive(false);
       setLivenessCount(0);
       setFingersShown(0);
       runVerify();
     });
+    if (!started) return;
   };
 
   // ---------- Demo: Show bot result (for invigilator / presentation) ----------
@@ -709,6 +924,10 @@ function App() {
 
   // ---------- Collect (starts liveness first) ----------
   const handleCollect = () => {
+    if (multiFaceDetected) {
+      showToast("Multiple faces detected. Only one face should be visible.", "error");
+      return;
+    }
     if (!cameraOn || !faceDetected) {
       showToast("Turn on the camera and ensure your face is detected first.", "error");
       return;
@@ -719,20 +938,25 @@ function App() {
     }
     if (buildSessionVector() == null) return;
 
-    startLiveness(() => {
+    const started = startLiveness(() => {
       setLivenessActive(false);
       setLivenessCount(0);
       setFingersShown(0);
       runCollect();
     });
+    if (!started) return;
   };
 
   const cancelLiveness = () => {
     livenessRef.current.active = false;
     livenessRef.current.onComplete = null;
     livenessRef.current.challengeType = null;
+    livenessRef.current.identityRef = null;
+    livenessRef.current.mismatchFrames = 0;
+    livenessRef.current.missingFrames = 0;
     livenessRef.current.fingerStableSince = null;
     livenessRef.current.fingerCountHistory = [];
+    livenessRef.current.earHistory = [];
     setLivenessActive(false);
     setLivenessCount(0);
     setFingersShown(0);
@@ -744,14 +968,14 @@ function App() {
       // Ctrl/Cmd + Enter: Verify
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
         e.preventDefault();
-        if (!loading.verify && faceDetected && keystrokes.length >= 2) {
+        if (!loading.verify && faceDetected && !multiFaceDetected && keystrokes.length >= 2) {
           handleVerify();
         }
       }
       // Ctrl/Cmd + S: Collect
       if ((e.ctrlKey || e.metaKey) && e.key === "s") {
         e.preventDefault();
-        if (!loading.collect && faceDetected && keystrokes.length >= 2) {
+        if (!loading.collect && faceDetected && !multiFaceDetected && keystrokes.length >= 2) {
           handleCollect();
         }
       }
@@ -759,7 +983,7 @@ function App() {
 
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
-  }, [loading, faceDetected, keystrokes.length]);
+  }, [loading, faceDetected, multiFaceDetected, keystrokes.length]);
 
   // Calculate typing stats
   const typingStats = keystrokes.length > 1
@@ -887,8 +1111,18 @@ function App() {
             />
             {cameraOn && (
               <div className="status-pill absolute top-3 right-3 flex items-center gap-2 px-3 py-1.5 rounded-full backdrop-blur-sm border border-white/10">
-                <div className={`w-2.5 h-2.5 rounded-full ${faceDetected ? "bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.6)] animate-pulse" : "bg-red-400"}`} />
-                <span className="text-xs font-medium text-white/90">{faceDetected ? "Face detected" : "No face"}</span>
+                <div
+                  className={`w-2.5 h-2.5 rounded-full ${
+                    multiFaceDetected
+                      ? "bg-amber-400 shadow-[0_0_12px_rgba(251,191,36,0.6)]"
+                      : faceDetected
+                        ? "bg-emerald-400 shadow-[0_0_12px_rgba(52,211,153,0.6)] animate-pulse"
+                        : "bg-red-400"
+                  }`}
+                />
+                <span className="text-xs font-medium text-white/90">
+                  {multiFaceDetected ? "Multiple faces" : faceDetected ? "Face detected" : "No face"}
+                </span>
               </div>
             )}
           </div>
@@ -909,6 +1143,9 @@ function App() {
               </button>
             )}
           </div>
+          {multiFaceDetected && (
+            <p className="mt-3 text-xs text-amber-400">Only one face is allowed for verification.</p>
+          )}
         </div>
 
         {typingStats && (
@@ -942,7 +1179,7 @@ function App() {
         <div className="mt-6 space-y-3">
           <button
             onClick={handleVerify}
-            disabled={loading.verify || !faceDetected || keystrokes.length < 2}
+            disabled={loading.verify || !faceDetected || multiFaceDetected || keystrokes.length < 2}
             className="w-full py-4 rounded-2xl font-semibold flex items-center justify-center gap-3 bg-cyan-500/15 text-cyan-400 border border-cyan-500/30 hover:bg-cyan-500/25 hover:shadow-[0_0_30px_-5px_rgba(34,211,238,0.4)] hover:scale-[1.02] hover:-translate-y-0.5 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:translate-y-0 transition-all duration-200"
           >
             {loading.verify ? (
@@ -959,7 +1196,7 @@ function App() {
           </button>
           <button
             onClick={handleCollect}
-            disabled={loading.collect || !faceDetected || keystrokes.length < 2}
+            disabled={loading.collect || !faceDetected || multiFaceDetected || keystrokes.length < 2}
             className="w-full py-4 rounded-2xl font-semibold flex items-center justify-center gap-3 bg-violet-500/15 text-violet-400 border border-violet-500/30 hover:bg-violet-500/25 hover:shadow-[0_0_30px_-5px_rgba(167,139,250,0.4)] hover:scale-[1.02] hover:-translate-y-0.5 active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:translate-y-0 transition-all duration-200"
           >
             {loading.collect ? (
