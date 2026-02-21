@@ -23,8 +23,8 @@ const EAR_CLOSED = 0.20;   // Eyes considered closed
 const EAR_OPEN = 0.28;     // Eyes considered open (higher = stricter)
 const BLINK_COOLDOWN_MS = 350;  // Min ms between blinks
 const EAR_SMOOTH_SAMPLES = 7;   // Running average for stability
-const FINGER_SMOOTH_SAMPLES = 5; // Majority vote for finger count
-const FINGER_STABLE_MS = 500;   // Must hold correct count this long
+const FINGER_SMOOTH_SAMPLES = 7; // Majority vote window for finger count
+const FINGER_STABLE_MS = 550;   // Must hold correct count this long
 const IDENTITY_SIMILARITY_MIN = 0.94;
 const IDENTITY_CENTER_SHIFT_MAX = 0.17;
 const IDENTITY_AREA_RATIO_MIN = 0.58;
@@ -32,53 +32,142 @@ const IDENTITY_AREA_RATIO_MAX = 1.72;
 const IDENTITY_MISMATCH_MAX = 6;
 const IDENTITY_MISSING_MAX = 8;
 const FACE_SIGNATURE_POINTS = [33, 263, 1, 61, 291, 4, 10, 152, 70, 300, 234, 454];
+const TYPING_IDENTITY_SIMILARITY_MIN = 0.92;
+const TYPING_CENTER_SHIFT_MAX = 0.24;
+const TYPING_AREA_RATIO_MIN = 0.5;
+const TYPING_AREA_RATIO_MAX = 1.95;
 
-// Count extended fingers from MediaPipe Hands (21 landmarks). Robust algorithm.
-function countExtendedFingers(landmarks) {
+function dist3(a, b) {
+  const dzWeight = 0.65;
+  return Math.hypot(a.x - b.x, a.y - b.y, (a.z - b.z) * dzWeight);
+}
+
+function angleBetween(v1, v2) {
+  const dot = v1.x * v2.x + v1.y * v2.y + v1.z * v2.z;
+  const mag1 = Math.hypot(v1.x, v1.y, v1.z);
+  const mag2 = Math.hypot(v2.x, v2.y, v2.z);
+  if (mag1 < 1e-6 || mag2 < 1e-6) return 0;
+  const cos = Math.max(-1, Math.min(1, dot / (mag1 * mag2)));
+  return (Math.acos(cos) * 180) / Math.PI;
+}
+
+function angleAt(a, b, c) {
+  const ba = { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+  const bc = { x: c.x - b.x, y: c.y - b.y, z: c.z - b.z };
+  return angleBetween(ba, bc);
+}
+
+function averagePoint(points) {
+  if (!points || points.length === 0) return { x: 0, y: 0, z: 0 };
+  const sum = points.reduce(
+    (acc, p) => ({
+      x: acc.x + p.x,
+      y: acc.y + p.y,
+      z: acc.z + p.z,
+    }),
+    { x: 0, y: 0, z: 0 }
+  );
+  return {
+    x: sum.x / points.length,
+    y: sum.y / points.length,
+    z: sum.z / points.length,
+  };
+}
+
+// Count extended fingers using joint straightness + reach + thumb spread checks.
+function countExtendedFingers(landmarks, handednessLabel = "") {
   if (!landmarks || landmarks.length < 21) return 0;
-  let count = 0;
+
   const wrist = landmarks[0];
+  const handScale = Math.max(
+    dist3(landmarks[5], landmarks[17]),
+    dist3(landmarks[0], landmarks[9])
+  );
+  if (handScale < 0.06) return 0;
 
-  const dist = (a, b) =>
-    Math.hypot(landmarks[a].x - landmarks[b].x, landmarks[a].y - landmarks[b].y);
+  const distFromWrist = (idx) => dist3(landmarks[idx], wrist);
+  const isFingerExtended = (mcp, pip, dip, tip, minReachRatio = 1.05) => {
+    const pipAngle = angleAt(landmarks[mcp], landmarks[pip], landmarks[dip]);
+    const dipAngle = angleAt(landmarks[pip], landmarks[dip], landmarks[tip]);
+    const reachRatio = distFromWrist(tip) / Math.max(distFromWrist(pip), 0.0001);
+    return pipAngle > 160 && dipAngle > 150 && reachRatio > minReachRatio;
+  };
 
-  // Four fingers: tip farther from wrist than MCP = extended
-  const fingers = [
-    { tip: 8, mcp: 5 },   // Index
-    { tip: 12, mcp: 9 },  // Middle
-    { tip: 16, mcp: 13 }, // Ring
-    { tip: 20, mcp: 17 }, // Pinky
-  ];
-  for (const { tip, mcp } of fingers) {
-    const dTip = dist(tip, 0);
-    const dMcp = dist(mcp, 0);
-    if (dTip > dMcp * 1.05) count++; // Tip extends beyond MCP
+  let count = 0;
+  if (isFingerExtended(5, 6, 7, 8, 1.05)) count += 1; // Index
+  if (isFingerExtended(9, 10, 11, 12, 1.06)) count += 1; // Middle
+  if (isFingerExtended(13, 14, 15, 16, 1.04)) count += 1; // Ring
+  if (isFingerExtended(17, 18, 19, 20, 1.03)) count += 1; // Pinky
+
+  const thumbIpAngle = angleAt(landmarks[2], landmarks[3], landmarks[4]);
+  const thumbMcpAngle = angleAt(landmarks[1], landmarks[2], landmarks[3]);
+  const thumbReachRatio = distFromWrist(4) / Math.max(distFromWrist(2), 0.0001);
+  const palmCenter = averagePoint([
+    landmarks[0],
+    landmarks[5],
+    landmarks[9],
+    landmarks[13],
+    landmarks[17],
+  ]);
+  const thumbPalmRatio =
+    dist3(landmarks[4], palmCenter) / Math.max(dist3(landmarks[3], palmCenter), 0.0001);
+  const thumbSpreadAngle = angleBetween(
+    {
+      x: landmarks[4].x - landmarks[0].x,
+      y: landmarks[4].y - landmarks[0].y,
+      z: landmarks[4].z - landmarks[0].z,
+    },
+    {
+      x: landmarks[5].x - landmarks[0].x,
+      y: landmarks[5].y - landmarks[0].y,
+      z: landmarks[5].z - landmarks[0].z,
+    }
+  );
+
+  let thumbExtended =
+    thumbIpAngle > 150 &&
+    thumbMcpAngle > 145 &&
+    thumbReachRatio > 1.15 &&
+    thumbPalmRatio > 1.08 &&
+    thumbSpreadAngle > 15;
+
+  // Handedness hint improves edge cases where thumb is half-open.
+  if (!thumbExtended && thumbReachRatio > 1.1) {
+    const thumbDir = landmarks[4].x - landmarks[3].x;
+    if (handednessLabel === "Right" && thumbDir < -handScale * 0.08) {
+      thumbExtended = true;
+    } else if (handednessLabel === "Left" && thumbDir > handScale * 0.08) {
+      thumbExtended = true;
+    }
   }
-
-  // Thumb: tip (4) farther from wrist than IP (3)
-  const dThumbTip = dist(4, 0);
-  const dThumbIp = dist(3, 0);
-  if (dThumbTip > dThumbIp * 1.08) count++;
+  if (thumbExtended) count += 1;
 
   return Math.min(5, Math.max(0, count));
 }
 
-// Majority vote from recent counts for stability
-function smoothFingerCount(history, required) {
-  if (history.length < FINGER_SMOOTH_SAMPLES) return null;
+function getMajorityFingerCount(history) {
+  if (!history || history.length === 0) return null;
   const recent = history.slice(-FINGER_SMOOTH_SAMPLES);
   const counts = {};
   for (const c of recent) {
     counts[c] = (counts[c] || 0) + 1;
   }
-  let best = -1, bestCount = 0;
-  for (const [c, n] of Object.entries(counts)) {
-    if (n > bestCount) {
-      bestCount = n;
-      best = parseInt(c, 10);
+  let best = null;
+  let bestCount = -1;
+  for (const [count, num] of Object.entries(counts)) {
+    if (num > bestCount) {
+      bestCount = num;
+      best = parseInt(count, 10);
     }
   }
-  return best === required ? best : null;
+  return best;
+}
+
+// Majority vote from recent counts for stability
+function smoothFingerCount(history, required) {
+  if (history.length < FINGER_SMOOTH_SAMPLES) return null;
+  const majority = getMajorityFingerCount(history);
+  return majority === required ? majority : null;
 }
 
 function cosineSimilarity(a, b) {
@@ -134,6 +223,43 @@ function buildFaceIdentitySnapshot(landmarks) {
   };
 }
 
+function cloneIdentitySnapshot(snapshot) {
+  if (!snapshot) return null;
+  return {
+    descriptor: [...snapshot.descriptor],
+    center: {
+      x: snapshot.center.x,
+      y: snapshot.center.y,
+    },
+    area: snapshot.area,
+  };
+}
+
+function isIdentityMatch(
+  reference,
+  current,
+  {
+    similarityMin = IDENTITY_SIMILARITY_MIN,
+    centerShiftMax = IDENTITY_CENTER_SHIFT_MAX,
+    areaRatioMin = IDENTITY_AREA_RATIO_MIN,
+    areaRatioMax = IDENTITY_AREA_RATIO_MAX,
+  } = {}
+) {
+  if (!reference || !current) return false;
+  const similarity = cosineSimilarity(reference.descriptor, current.descriptor);
+  const centerShift = Math.hypot(
+    reference.center.x - current.center.x,
+    reference.center.y - current.center.y
+  );
+  const areaRatio = current.area / (reference.area || current.area);
+  return (
+    similarity >= similarityMin &&
+    centerShift <= centerShiftMax &&
+    areaRatio >= areaRatioMin &&
+    areaRatio <= areaRatioMax
+  );
+}
+
 function App() {
   const [content, setContent] = useState("");
   const [keystrokes, setKeystrokes] = useState([]);
@@ -145,6 +271,7 @@ function App() {
   const [multiFaceDetected, setMultiFaceDetected] = useState(false);
   const faceVectorRef = useRef([]);
   const latestFaceIdentityRef = useRef(null);
+  const typingIdentityRef = useRef(null);
   const faceDetectedRef = useRef(false);
   const multiFaceDetectedRef = useRef(false);
   const [theme, setTheme] = useState(() => {
@@ -225,6 +352,37 @@ function App() {
     showToast(message, "error");
   };
 
+  const validateTypingIdentity = () => {
+    if (!typingIdentityRef.current) {
+      showToast(
+        "Type while exactly one face is visible, then verify with the same person.",
+        "error"
+      );
+      return false;
+    }
+    const current = latestFaceIdentityRef.current;
+    if (!current || !faceDetectedRef.current || multiFaceDetectedRef.current) {
+      showToast("Keep exactly one face visible before verifying.", "error");
+      return false;
+    }
+    const match = isIdentityMatch(typingIdentityRef.current, current, {
+      similarityMin: TYPING_IDENTITY_SIMILARITY_MIN,
+      centerShiftMax: TYPING_CENTER_SHIFT_MAX,
+      areaRatioMin: TYPING_AREA_RATIO_MIN,
+      areaRatioMax: TYPING_AREA_RATIO_MAX,
+    });
+    if (!match) {
+      typingIdentityRef.current = null;
+      setKeystrokes([]);
+      showToast(
+        "Face changed after typing. Keystrokes were reset. Type again with the same person.",
+        "error"
+      );
+      return false;
+    }
+    return true;
+  };
+
   // ---------- Start Camera ----------
   const startCamera = async () => {
     try {
@@ -259,10 +417,18 @@ function App() {
         const l = livenessRef.current;
         if (!l.active || l.challengeType !== "fingers") return;
         if (results.multiHandLandmarks?.length > 0) {
-          const count = countExtendedFingers(results.multiHandLandmarks[0]);
+          const handScore = results.multiHandedness?.[0]?.score ?? 1;
+          if (handScore < 0.55) {
+            l.fingerStableSince = null;
+            setFingersShownRef.current?.(0);
+            return;
+          }
+          const handednessLabel = results.multiHandedness?.[0]?.label || "";
+          const count = countExtendedFingers(results.multiHandLandmarks[0], handednessLabel);
           l.fingerCountHistory = (l.fingerCountHistory || []).slice(-FINGER_SMOOTH_SAMPLES);
           l.fingerCountHistory.push(count);
-          setFingersShownRef.current?.(count);
+          const majority = getMajorityFingerCount(l.fingerCountHistory);
+          setFingersShownRef.current?.(majority ?? count);
 
           const smoothed = smoothFingerCount(l.fingerCountHistory, l.required);
           const now = Date.now();
@@ -297,6 +463,10 @@ function App() {
         const faceCount = faces.length;
 
         if (faceCount > 1) {
+          if (!multiFaceDetectedRef.current) {
+            typingIdentityRef.current = null;
+            setKeystrokes([]);
+          }
           setMultiFaceDetectedSafe(true);
           setFaceDetectedSafe(false);
           faceVectorRef.current = [];
@@ -450,6 +620,7 @@ function App() {
     }
     faceVectorRef.current = [];
     latestFaceIdentityRef.current = null;
+    typingIdentityRef.current = null;
     setFaceDetectedSafe(false);
     setMultiFaceDetectedSafe(false);
     setCameraOn(false);
@@ -467,6 +638,7 @@ function App() {
       }
       faceVectorRef.current = [];
       latestFaceIdentityRef.current = null;
+      typingIdentityRef.current = null;
       faceDetectedRef.current = false;
       multiFaceDetectedRef.current = false;
     };
@@ -678,7 +850,13 @@ function App() {
     const handleKey = (e) => {
       // Don't capture keystrokes for shortcuts
       if (e.ctrlKey || e.metaKey || e.altKey) return;
-      
+
+      if (!faceDetectedRef.current || multiFaceDetectedRef.current) return;
+      const snapshot = latestFaceIdentityRef.current;
+      if (!snapshot) return;
+      if (!typingIdentityRef.current) {
+        typingIdentityRef.current = cloneIdentitySnapshot(snapshot);
+      }
       setKeystrokes((prev) => [...prev, Date.now()]);
     };
 
@@ -698,6 +876,7 @@ function App() {
     setContent("");
     setKeystrokes([]);
     setResult(null);
+    typingIdentityRef.current = null;
   };
 
   // Keep refs in sync for liveness callbacks
@@ -772,20 +951,13 @@ function App() {
       return false;
     }
 
-    const identityAnchor = latestFaceIdentityRef.current;
+    const identityAnchor = typingIdentityRef.current;
     if (!identityAnchor) {
-      showToast("Face lock not ready. Keep your face centered and try again.", "error");
+      showToast("Typing-linked face lock not ready. Type with one visible face first.", "error");
       return false;
     }
 
-    const identityRef = {
-      descriptor: [...identityAnchor.descriptor],
-      center: {
-        x: identityAnchor.center.x,
-        y: identityAnchor.center.y,
-      },
-      area: identityAnchor.area,
-    };
+    const identityRef = cloneIdentitySnapshot(identityAnchor);
 
     const rand = Math.random();
     if (rand < 0.5) {
@@ -795,7 +967,7 @@ function App() {
       setLivenessRequired(required);
       setLivenessCount(0);
       setLivenessPrompt(
-        `Blink ${required} time${required === 1 ? "" : "s"} and keep the same face in frame`
+        `Blink ${required} time${required === 1 ? "" : "s"} and keep the same person who typed in frame`
       );
       setLivenessChallengeType("blink");
       setLivenessActive(true);
@@ -822,7 +994,7 @@ function App() {
       setFingersShown(0);
       setLivenessCount(0);
       setLivenessPrompt(
-        `Show ${required} finger${required === 1 ? "" : "s"} while keeping the same face visible`
+        `Show ${required} finger${required === 1 ? "" : "s"} while keeping the same person who typed visible`
       );
       setLivenessChallengeType("fingers");
       setLivenessActive(true);
@@ -859,6 +1031,7 @@ function App() {
       showToast("Type at least a few keystrokes before verifying.", "error");
       return;
     }
+    if (!validateTypingIdentity()) return;
     if (buildSessionVector() == null) return;
 
     const started = startLiveness(() => {
@@ -936,6 +1109,7 @@ function App() {
       showToast("Type at least a few keystrokes before collecting.", "error");
       return;
     }
+    if (!validateTypingIdentity()) return;
     if (buildSessionVector() == null) return;
 
     const started = startLiveness(() => {
