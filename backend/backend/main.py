@@ -26,6 +26,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "luma_model.pth")
 SCALER_PATH = os.path.join(BASE_DIR, "scaler.pkl")
 DATASET_PATH = os.path.join(BASE_DIR, "dataset.json")
+CALIBRATOR_PATH = os.path.join(BASE_DIR, "calibrator.pkl")
+THRESHOLD_PATH = os.path.join(BASE_DIR, "threshold.json")
 
 # ===============================
 # CLASSIFIER MODEL
@@ -55,6 +57,8 @@ class LumaFusionModel(nn.Module):
 scaler = None
 model = None
 input_size = 103  # default
+calibrator = None
+decision_threshold = 0.5
 
 if os.path.exists(SCALER_PATH) and os.path.exists(MODEL_PATH):
     scaler = joblib.load(SCALER_PATH)
@@ -64,6 +68,19 @@ if os.path.exists(SCALER_PATH) and os.path.exists(MODEL_PATH):
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
     model.eval()
 
+if os.path.exists(CALIBRATOR_PATH):
+    calibrator = joblib.load(CALIBRATOR_PATH)
+
+if os.path.exists(THRESHOLD_PATH):
+    try:
+        with open(THRESHOLD_PATH, "r", encoding="utf-8") as f:
+            threshold_payload = json.load(f)
+        candidate = float(threshold_payload.get("threshold", 0.5))
+        if 0.0 < candidate < 1.0:
+            decision_threshold = candidate
+    except (ValueError, TypeError, json.JSONDecodeError):
+        decision_threshold = 0.5
+
 # ===============================
 # REQUEST MODEL
 # ===============================
@@ -72,6 +89,16 @@ class SessionData(BaseModel):
     session_vector: list
     content: str
     label: int | None = None  # Only used for collect
+
+
+def _calibrate_probability(prob: float) -> float:
+    if calibrator is None:
+        return float(prob)
+    try:
+        calibrated = calibrator.predict_proba(np.array([[prob]], dtype=np.float32))[0][1]
+        return float(np.clip(calibrated, 0.0, 1.0))
+    except Exception:
+        return float(prob)
 
 
 @app.get("/health")
@@ -107,9 +134,10 @@ def verify(data: SessionData):
     tensor = torch.tensor(session_vector_scaled, dtype=torch.float32).to(device)
 
     with torch.no_grad():
-        prob = model(tensor).item()
+        raw_prob = model(tensor).item()
 
-    prediction = 1 if prob >= 0.5 else 0
+    prob = _calibrate_probability(raw_prob)
+    prediction = 1 if prob >= decision_threshold else 0
 
     combined_hash = hashlib.sha256(
         data.content.encode() + session_vector.tobytes()
@@ -117,7 +145,9 @@ def verify(data: SessionData):
 
     return {
         "human_probability": float(prob),
+        "raw_human_probability": float(raw_prob),
         "prediction": prediction,
+        "decision_threshold": float(decision_threshold),
         "hash": combined_hash
     }
 
@@ -206,7 +236,8 @@ def _predict_probability(vec_list: list) -> float | None:
     arr = scaler.transform(arr)
     t = torch.tensor(arr, dtype=torch.float32).to(device)
     with torch.no_grad():
-        return model(t).item()
+        raw = model(t).item()
+    return _calibrate_probability(raw)
 
 
 def _make_demo_bot_vector(human_vectors: list, strong: bool = False) -> list:
@@ -242,7 +273,7 @@ def get_demo_bot_vector():
     if len(human_vectors) == 0:
         raise HTTPException(status_code=400, detail="No human samples. Use 'Collect Human Training Sample' first.")
 
-    # If model is loaded, return a vector that scores as bot (prob < 0.5)
+    # If model is loaded, return a vector that scores as bot (prob < decision_threshold)
     if model is not None and scaler is not None:
         # Try existing bot vectors first (they were used in training)
         for _ in range(min(20, max(len(bot_vectors), 1))):
@@ -251,14 +282,14 @@ def get_demo_bot_vector():
             else:
                 vec = _make_demo_bot_vector(human_vectors, strong=False)
             prob = _predict_probability(vec)
-            if prob is not None and prob < 0.5:
+            if prob is not None and prob < decision_threshold:
                 return {"session_vector": vec}
 
         # Try stronger synthetic bot vectors
         for _ in range(30):
             vec = _make_demo_bot_vector(human_vectors, strong=True)
             prob = _predict_probability(vec)
-            if prob is not None and prob < 0.5:
+            if prob is not None and prob < decision_threshold:
                 return {"session_vector": vec}
 
         # Fallback: return vector with lowest prob among a few attempts

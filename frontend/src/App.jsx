@@ -19,12 +19,23 @@ function getEAR(landmarks) {
   return { left: earLeft, right: earRight, avg: (earLeft + earRight) / 2 };
 }
 
-const EAR_CLOSED = 0.20;   // Eyes considered closed
-const EAR_OPEN = 0.28;     // Eyes considered open (higher = stricter)
-const BLINK_COOLDOWN_MS = 350;  // Min ms between blinks
-const EAR_SMOOTH_SAMPLES = 7;   // Running average for stability
+const EAR_CLOSED = 0.22;   // Eyes considered closed
+const EAR_OPEN = 0.255;    // Eyes considered open after a blink
+const BLINK_COOLDOWN_MS = 220;  // Min ms between blinks
+const EAR_SMOOTH_SAMPLES = 4;   // Running average for stability
 const FINGER_SMOOTH_SAMPLES = 7; // Majority vote window for finger count
 const FINGER_STABLE_MS = 550;   // Must hold correct count this long
+const FACE_DETECTION_MIN_CONFIDENCE = 0.42;
+const FACE_TRACKING_MIN_CONFIDENCE = 0.36;
+const FACE_MISSING_FRAME_TOLERANCE = 8;
+const CAMERA_WIDTH = 640;
+const CAMERA_HEIGHT = 480;
+const CAMERA_FRAME_RATE_IDEAL = 24;
+const CAMERA_BRIGHTNESS_MIN = 70;
+const CAMERA_BRIGHTNESS_MAX = 180;
+const CAMERA_CONTRAST_MIN = 70;
+const CAMERA_CONTRAST_MAX = 180;
+const CAMERA_FILTER_DEFAULT = { brightness: 100, contrast: 100 };
 const IDENTITY_SIMILARITY_MIN = 0.9;
 const IDENTITY_CENTER_SHIFT_MAX = 0.24;
 const IDENTITY_AREA_RATIO_MIN = 0.45;
@@ -269,11 +280,15 @@ function App() {
   const [toast, setToast] = useState({ show: false, message: "", type: "success" });
   const [faceDetected, setFaceDetected] = useState(false);
   const [multiFaceDetected, setMultiFaceDetected] = useState(false);
+  const [cameraFilter, setCameraFilter] = useState(CAMERA_FILTER_DEFAULT);
+  const [cameraTuningOpen, setCameraTuningOpen] = useState(false);
   const faceVectorRef = useRef([]);
   const latestFaceIdentityRef = useRef(null);
   const typingIdentityRef = useRef(null);
   const faceDetectedRef = useRef(false);
   const multiFaceDetectedRef = useRef(false);
+  const noFaceFramesRef = useRef(0);
+  const cameraFilterRef = useRef(CAMERA_FILTER_DEFAULT);
   const [theme, setTheme] = useState(() => {
     if (typeof window === "undefined") return "dark";
     const saved = window.localStorage.getItem("luma-theme");
@@ -318,6 +333,8 @@ function App() {
   const streamRef = useRef(null);
   const faceMeshRef = useRef(null);
   const handsRef = useRef(null);
+  const processingCanvasRef = useRef(null);
+  const processingCtxRef = useRef(null);
   const [fingersShown, setFingersShown] = useState(0);
   const setFingersShownRef = useRef(() => {});
 
@@ -333,6 +350,29 @@ function App() {
       multiFaceDetectedRef.current = next;
       setMultiFaceDetected(next);
     }
+  };
+
+  useEffect(() => {
+    cameraFilterRef.current = cameraFilter;
+  }, [cameraFilter]);
+
+  const updateCameraFilter = (key, value) => {
+    setCameraFilter((prev) => ({
+      ...prev,
+      [key]: value,
+    }));
+  };
+
+  const resetCameraFilter = () => {
+    setCameraFilter(CAMERA_FILTER_DEFAULT);
+  };
+
+  const closeCameraTuning = () => {
+    setCameraTuningOpen(false);
+  };
+
+  const toggleCameraTuning = () => {
+    setCameraTuningOpen((prev) => !prev);
   };
 
   const failLivenessIdentity = (message) => {
@@ -382,12 +422,112 @@ function App() {
     return true;
   };
 
+  const requestCameraStream = async () => {
+    const preferredConstraints = {
+      facingMode: { ideal: "user" },
+      width: { ideal: CAMERA_WIDTH },
+      height: { ideal: CAMERA_HEIGHT },
+      frameRate: { ideal: CAMERA_FRAME_RATE_IDEAL, max: 30 },
+    };
+
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        video: preferredConstraints,
+        audio: false,
+      });
+    } catch {
+      return await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+    }
+  };
+
+  const optimizeVideoTrackForLowLight = async (stream) => {
+    const track = stream?.getVideoTracks?.()[0];
+    if (!track || !track.getCapabilities || !track.applyConstraints) return;
+
+    const caps = track.getCapabilities();
+    const advanced = {};
+
+    if (Array.isArray(caps.exposureMode) && caps.exposureMode.includes("continuous")) {
+      advanced.exposureMode = "continuous";
+    }
+    if (Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes("continuous")) {
+      advanced.whiteBalanceMode = "continuous";
+    }
+    if (Array.isArray(caps.focusMode) && caps.focusMode.includes("continuous")) {
+      advanced.focusMode = "continuous";
+    }
+    if (caps.exposureCompensation?.max !== undefined && caps.exposureCompensation?.min !== undefined) {
+      const min = caps.exposureCompensation.min;
+      const max = caps.exposureCompensation.max;
+      const boosted = min + (max - min) * 0.7;
+      advanced.exposureCompensation = Math.max(min, Math.min(max, boosted));
+    }
+    if (caps.brightness?.max !== undefined && caps.brightness?.min !== undefined) {
+      const min = caps.brightness.min;
+      const max = caps.brightness.max;
+      const boosted = min + (max - min) * 0.65;
+      advanced.brightness = Math.max(min, Math.min(max, boosted));
+    }
+
+    if (Object.keys(advanced).length === 0) return;
+
+    try {
+      await track.applyConstraints({ advanced: [advanced] });
+    } catch (error) {
+      console.warn("Low-light track optimization not fully supported:", error);
+    }
+  };
+
+  const getCameraInputFrame = () => {
+    const video = videoRef.current;
+    if (!video) return null;
+
+    const { brightness, contrast } = cameraFilterRef.current;
+    const needsFilter =
+      brightness !== CAMERA_FILTER_DEFAULT.brightness ||
+      contrast !== CAMERA_FILTER_DEFAULT.contrast;
+
+    if (!needsFilter) {
+      return video;
+    }
+
+    let canvas = processingCanvasRef.current;
+    if (!canvas) {
+      canvas = document.createElement("canvas");
+      processingCanvasRef.current = canvas;
+    }
+
+    const width = video.videoWidth || CAMERA_WIDTH;
+    const height = video.videoHeight || CAMERA_HEIGHT;
+
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+
+    let ctx = processingCtxRef.current;
+    if (!ctx) {
+      ctx = canvas.getContext("2d");
+      processingCtxRef.current = ctx;
+    }
+    if (!ctx) return video;
+
+    ctx.clearRect(0, 0, width, height);
+    ctx.filter = `brightness(${brightness}%) contrast(${contrast}%)`;
+    ctx.drawImage(video, 0, 0, width, height);
+    ctx.filter = "none";
+
+    return canvas;
+  };
+
   // ---------- Start Camera ----------
   const startCamera = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      const stream = await requestCameraStream();
+      await optimizeVideoTrackForLowLight(stream);
       videoRef.current.srcObject = stream;
       streamRef.current = stream;
+      noFaceFramesRef.current = 0;
       setCameraOn(true);
 
       const faceMesh = new FaceMesh({
@@ -398,8 +538,8 @@ function App() {
       faceMesh.setOptions({
         maxNumFaces: 2,
         refineLandmarks: true,
-        minDetectionConfidence: 0.5,
-        minTrackingConfidence: 0.5,
+        minDetectionConfidence: FACE_DETECTION_MIN_CONFIDENCE,
+        minTrackingConfidence: FACE_TRACKING_MIN_CONFIDENCE,
       });
 
       const hands = new Hands({
@@ -462,6 +602,7 @@ function App() {
         const faceCount = faces.length;
 
         if (faceCount > 1) {
+          noFaceFramesRef.current = 0;
           if (!multiFaceDetectedRef.current) {
             typingIdentityRef.current = null;
             setKeystrokes([]);
@@ -480,6 +621,7 @@ function App() {
         setMultiFaceDetectedSafe(false);
 
         if (faceCount === 1) {
+          noFaceFramesRef.current = 0;
           const landmarks = faces[0];
           let vector = [];
 
@@ -544,14 +686,16 @@ function App() {
                 l.earHistory.length >= EAR_SMOOTH_SAMPLES
                   ? l.earHistory.reduce((a, b) => a + b, 0) / l.earHistory.length
                   : raw.avg;
-              const bothClosed = raw.left < EAR_CLOSED && raw.right < EAR_CLOSED;
-              const bothOpen = raw.left >= EAR_OPEN && raw.right >= EAR_OPEN;
+              const closedNow =
+                ear < EAR_CLOSED ||
+                (raw.left < EAR_CLOSED + 0.01 && raw.right < EAR_CLOSED + 0.01);
+              const openNow = ear > EAR_OPEN;
               const now = Date.now();
 
-              if (bothClosed && !l.eyesClosed) {
+              if (closedNow && !l.eyesClosed) {
                 l.eyesClosed = true;
               } else if (
-                bothOpen &&
+                openNow &&
                 l.eyesClosed &&
                 now - l.lastBlinkTime > BLINK_COOLDOWN_MS
               ) {
@@ -576,9 +720,12 @@ function App() {
             }
           }
         } else {
-          setFaceDetectedSafe(false);
-          faceVectorRef.current = [];
-          latestFaceIdentityRef.current = null;
+          noFaceFramesRef.current += 1;
+          if (noFaceFramesRef.current >= FACE_MISSING_FRAME_TOLERANCE) {
+            setFaceDetectedSafe(false);
+            faceVectorRef.current = [];
+            latestFaceIdentityRef.current = null;
+          }
           const l = livenessRef.current;
           if (l.active) {
             l.missingFrames += 1;
@@ -591,14 +738,17 @@ function App() {
 
       const camera = new Camera(videoRef.current, {
         onFrame: async () => {
-          await faceMesh.send({ image: videoRef.current });
+          const frameInput = getCameraInputFrame();
+          if (!frameInput) return;
+
+          await faceMesh.send({ image: frameInput });
           const l = livenessRef.current;
           if (l.active && l.challengeType === "fingers" && handsRef.current) {
-            await handsRef.current.send({ image: videoRef.current });
+            await handsRef.current.send({ image: frameInput });
           }
         },
-        width: 640,
-        height: 480,
+        width: CAMERA_WIDTH,
+        height: CAMERA_HEIGHT,
       });
 
       camera.start();
@@ -620,6 +770,10 @@ function App() {
     faceVectorRef.current = [];
     latestFaceIdentityRef.current = null;
     typingIdentityRef.current = null;
+    noFaceFramesRef.current = 0;
+    processingCtxRef.current = null;
+    processingCanvasRef.current = null;
+    setCameraTuningOpen(false);
     setFaceDetectedSafe(false);
     setMultiFaceDetectedSafe(false);
     setCameraOn(false);
@@ -638,6 +792,10 @@ function App() {
       faceVectorRef.current = [];
       latestFaceIdentityRef.current = null;
       typingIdentityRef.current = null;
+      noFaceFramesRef.current = 0;
+      processingCtxRef.current = null;
+      processingCanvasRef.current = null;
+      setCameraTuningOpen(false);
       faceDetectedRef.current = false;
       multiFaceDetectedRef.current = false;
     };
@@ -937,6 +1095,8 @@ function App() {
   };
 
   const startLiveness = (onComplete) => {
+    setCameraTuningOpen(false);
+
     if (multiFaceDetectedRef.current) {
       showToast("Multiple faces detected. Only one face should be visible.", "error");
       return false;
@@ -952,8 +1112,8 @@ function App() {
 
     const rand = Math.random();
     if (rand < 0.5) {
-      // Blink challenge: 1-3 blinks (weighted toward 2)
-      const blinkOptions = [1, 2, 2, 2, 3]; // More 2s for common case
+      // Blink challenge: keep short so registration feels immediate.
+      const blinkOptions = [1, 1, 1, 2, 2];
       const required = blinkOptions[Math.floor(Math.random() * blinkOptions.length)];
       setLivenessRequired(required);
       setLivenessCount(0);
@@ -1228,6 +1388,51 @@ function App() {
         </div>
       )}
 
+      {cameraTuningOpen && (
+        <div className="camera-popup-backdrop" onClick={closeCameraTuning}>
+          <div className="camera-popup" onClick={(e) => e.stopPropagation()}>
+            <div className="camera-popup-head">
+              <p className="camera-popup-title">Light Adjustment</p>
+              <button type="button" className="camera-popup-close" onClick={closeCameraTuning}>
+                Close
+              </button>
+            </div>
+
+            <div className="camera-tuning-panel">
+              <label className="camera-tuning-row">
+                <span>Light {cameraFilter.brightness}%</span>
+                <input
+                  type="range"
+                  min={CAMERA_BRIGHTNESS_MIN}
+                  max={CAMERA_BRIGHTNESS_MAX}
+                  step={1}
+                  value={cameraFilter.brightness}
+                  onChange={(e) => updateCameraFilter("brightness", parseInt(e.target.value, 10))}
+                />
+              </label>
+
+              <label className="camera-tuning-row">
+                <span>Contrast {cameraFilter.contrast}%</span>
+                <input
+                  type="range"
+                  min={CAMERA_CONTRAST_MIN}
+                  max={CAMERA_CONTRAST_MAX}
+                  step={1}
+                  value={cameraFilter.contrast}
+                  onChange={(e) => updateCameraFilter("contrast", parseInt(e.target.value, 10))}
+                />
+              </label>
+            </div>
+
+            <div className="camera-popup-actions">
+              <button type="button" onClick={resetCameraFilter} className="camera-tuning-reset">
+                Reset
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {toast.show && (
         <div className={`toast-chip animate-slide-in ${toast.type === "success" ? "toast-success" : "toast-error"}`}>
           <span className="toast-symbol">{toast.type === "success" ? "OK" : "ERR"}</span>
@@ -1267,6 +1472,9 @@ function App() {
                 autoPlay
                 playsInline
                 className="video-frame"
+                style={{
+                  filter: `brightness(${cameraFilter.brightness}%) contrast(${cameraFilter.contrast}%)`,
+                }}
               />
               {cameraOn && (
                 <div className="status-pill">
@@ -1296,6 +1504,14 @@ function App() {
                   Stop camera
                 </button>
               )}
+              <button
+                type="button"
+                onClick={toggleCameraTuning}
+                className="pill-btn pill-neutral"
+                disabled={!cameraOn}
+              >
+                {cameraTuningOpen ? "Close light controls" : "Adjust light"}
+              </button>
             </div>
 
             {multiFaceDetected && (
@@ -1395,7 +1611,7 @@ function App() {
                 {typeof result.human_probability === "number" && (
                   <div className="probability-block">
                     <div className="probability-header">
-                      <span>Human probability</span>
+                      <span>Calibrated human confidence</span>
                       <strong>{(result.human_probability * 100).toFixed(1)}%</strong>
                     </div>
                     <div className="probability-track">
@@ -1404,6 +1620,9 @@ function App() {
                         style={{ width: `${result.human_probability * 100}%` }}
                       />
                     </div>
+                    <p className="confidence-note">
+                      Confidence score only. Dataset accuracy is measured during training, not per request.
+                    </p>
                   </div>
                 )}
 
